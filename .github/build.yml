@@ -39,11 +39,26 @@ jobs:
           path: C:\psdeps
           key: psdeps-${{ steps.ver.outputs.tag }}-v1
 
+      - name: Insertar motor de color (Prusa Colorin)
+        shell: pwsh
+        run: |
+          Copy-Item -Recurse -Force "$env:GITHUB_WORKSPACE\colorin\libslic3r\*" "C:\ps\src\libslic3r\"
+          $files = Get-ChildItem "$env:GITHUB_WORKSPACE\colorin\libslic3r" -Recurse -Include *.cpp,*.hpp,*.h |
+                   ForEach-Object { $_.FullName.Substring("$env:GITHUB_WORKSPACE\colorin\libslic3r\".Length).Replace('\','/') }
+          $lines = "`ntarget_sources(libslic3r PRIVATE`n" + (($files | ForEach-Object { "    $_" }) -join "`n") + "`n)`n"
+          Add-Content -Path "C:\ps\src\libslic3r\CMakeLists.txt" -Value $lines
+          Write-Host "Archivos del motor agregados: $($files.Count)"
+
       - name: Compilar dependencias y programa
+        id: cache-check
         shell: cmd
         working-directory: C:\ps
         run: |
-          call build_win.bat -d=%DEPS% -c=Release -s=all
+          if exist C:\psdeps\NUL (
+            call build_win.bat -d=%DEPS% -c=Release -s=app
+          ) else (
+            call build_win.bat -d=%DEPS% -c=Release -s=all
+          )
 
       - name: Empaquetar portable
         shell: pwsh
