@@ -48,6 +48,13 @@ jobs:
           Add-Content -Path "C:\ps\src\libslic3r\CMakeLists.txt" -Value $lines
           Write-Host "Archivos del motor agregados: $($files.Count)"
 
+      - name: Aplicar cambios de Prusa Colorin a PrusaSlicer 2.9.6
+        shell: pwsh
+        run: |
+          # Archivos de PrusaSlicer 2.9.6 ya modificados para el motor de color.
+          Copy-Item -Recurse -Force "$env:GITHUB_WORKSPACE\colorin\prusa_2.9.6\src\*" "C:\ps\src\"
+          Get-ChildItem "$env:GITHUB_WORKSPACE\colorin\prusa_2.9.6" -Recurse -File | ForEach-Object { Write-Host "Reemplazado: $($_.Name)" }
+
       - name: Compilar dependencias y programa
         id: cache-check
         shell: cmd
