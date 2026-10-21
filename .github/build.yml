@@ -17,13 +17,12 @@ jobs:
       - name: Repo Prusa Colorin
         uses: actions/checkout@v4
 
-      - name: Ultima version estable de PrusaSlicer
+      - name: Version base fija de PrusaSlicer
         id: ver
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          TAG=$(gh release list -R prusa3d/PrusaSlicer --exclude-pre-releases --exclude-drafts --limit 1 --json tagName -q '.[0].tagName')
+          # Version base fijada. Solo cambia cuando Arturo lo decida.
+          TAG=version_2.9.6
           echo "Version base: $TAG"
           echo "tag=$TAG" >> $GITHUB_OUTPUT
 
