@@ -1163,6 +1163,49 @@ static void validate_print_config_change(const PrintConfig &old_config, const Dy
     }
 }
 
+// Prusa Colorin (FullSpectrum)
+static inline void append_unique_painted_extruder(std::vector<unsigned int> &painting_extruders,
+                                                  unsigned int                extruder_id,
+                                                  size_t                      num_physical_extruders)
+{
+    if (extruder_id < 1 || extruder_id > num_physical_extruders)
+        return;
+    if (std::find(painting_extruders.begin(), painting_extruders.end(), extruder_id) == painting_extruders.end())
+        painting_extruders.emplace_back(extruder_id);
+}
+
+static void append_mixed_component_extruders(const MixedFilamentManager &mixed_mgr,
+                                             unsigned int                state_id,
+                                             size_t                      num_physical_extruders,
+                                             std::vector<unsigned int>  &painting_extruders)
+{
+    if (state_id <= num_physical_extruders)
+        return;
+
+    const std::optional<MixedFilamentDefinition> definition_opt =
+        mixed_mgr.mixed_filament_definition_from_id(state_id, num_physical_extruders);
+    if (!definition_opt)
+        return;
+
+    // Pre-create painted target regions for every physical filament a mixed row
+    // may resolve to. apply_mm_segmentation can then collapse ordinary mixed
+    // channels onto the active physical tool for a layer without losing the
+    // destination region.
+    const MixedFilamentDefinition &definition = *definition_opt;
+    if (definition.visibility.tombstoned)
+        return;
+
+    const MixedFilamentPrimaryPairView pair = definition.recipe.blend.primary_pair_or();
+    append_unique_painted_extruder(painting_extruders, pair.component_a.id, num_physical_extruders);
+    append_unique_painted_extruder(painting_extruders, pair.component_b.id, num_physical_extruders);
+
+    for (const unsigned int extruder_id : definition.recipe.blend.component_ids(num_physical_extruders))
+        append_unique_painted_extruder(painting_extruders, extruder_id, num_physical_extruders);
+
+    for (const unsigned int extruder_id : mixed_filament_manual_pattern_sequence(definition, num_physical_extruders))
+        append_unique_painted_extruder(painting_extruders, extruder_id, num_physical_extruders);
+}
+
 Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_config, std::vector<std::string> *warnings, const DynamicPrintConfig* original_config)
 {
 #ifdef _DEBUG
@@ -1178,8 +1221,11 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 
     const unsigned int     num_physical_extruders = static_cast<unsigned int>(
         new_full_config.option<ConfigOptionFloats>("nozzle_diameter")->values.size());
-    const VirtualExtruders virtual_extruders      = filter_virtual_extruders_for_physical_count(
-        num_physical_extruders, model.virtual_extruders);
+    // Prusa Colorin (FullSpectrum)
+    // Option A: the FullSpectrum (ratdoux) mixed filament engine replaces PrusaSlicer's native
+    // Full Spectrum virtual extruders. Every PrusaSlicer virtual-extruder code path is guarded by
+    // virtual_extruders().empty(), so keeping this list empty disconnects the native system.
+    const VirtualExtruders virtual_extruders      = {};
 
     // Find modified keys of the various configs. Resolve overrides extruder retract values by filament profiles.
     DynamicPrintConfig   filament_overrides;
@@ -1268,6 +1314,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     // Regenerate mixed (virtual) filaments from physical filament colours and re-apply the
     // user custom mixed definitions, exactly as OrcaSlicer FullSpectrum Print::apply() does.
     // PrusaSlicer moves new_full_config into m_full_print_config above, so read from there.
+    size_t num_total_filaments = m_config.nozzle_diameter.size();
     {
         const DynamicPrintConfig &mixed_cfg = m_full_print_config;
         const size_t num_physical_extruders = m_config.nozzle_diameter.size();
@@ -1300,6 +1347,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                                 << ", physical_extruders=" << num_physical_extruders
                                 << ", mixed_total=" << m_mixed_filament_mgr.mixed_filament_count()
                                 << ", mixed_visible=" << m_mixed_filament_mgr.visible_count();
+        // Total filaments = physical extruders + visible mixed (virtual) filaments.
+        num_total_filaments = m_mixed_filament_mgr.total_filaments(num_physical_extruders);
     }
 
     // Check the position and rotation of the wipe tower.
@@ -1496,7 +1545,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 			if (object_config_changed)
 				model_object.config.assign_config(model_object_new.config);
             if (! object_diff.empty() || object_config_changed || num_extruders_changed) {
-                PrintObjectConfig new_config = PrintObject::object_config_from_model_object(m_default_object_config, model_object, num_physical_extruders);
+                PrintObjectConfig new_config = PrintObject::object_config_from_model_object(m_default_object_config, model_object, num_total_filaments); // Prusa Colorin (FullSpectrum)
                 for (const PrintObjectStatus &print_object_status : print_object_status_db.get_range(model_object)) {
                     t_config_option_keys diff = print_object_status.print_object->config().diff(new_config);
                     if (! diff.empty()) {
@@ -1567,7 +1616,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             auto print_object_apply_config = [this, &print_object_last, model_object, num_physical_extruders](PrintObject *print_object) {
                 print_object->config_apply(print_object_last ?
                     print_object_last->config() :
-                    PrintObject::object_config_from_model_object(m_default_object_config, *model_object, num_physical_extruders));
+                    PrintObject::object_config_from_model_object(m_default_object_config, *model_object, num_total_filaments));
                 print_object_last = print_object;
             };
             if (old.empty()) {
@@ -1670,11 +1719,25 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 #endif
             }
 
+            // Prusa Colorin (FullSpectrum)
+            size_t dropped_painted_states = 0;
             for (size_t state_idx = static_cast<size_t>(TriangleStateType::Extruder1); state_idx < used_facet_states.size(); ++state_idx) {
-                if (used_facet_states[state_idx]) {
-                    painting_extruders.emplace_back(state_idx);
-                }
+                if (!used_facet_states[state_idx])
+                    continue;
+                if (state_idx <= num_total_filaments) {
+                    painting_extruders.emplace_back(static_cast<unsigned int>(state_idx));
+                    append_mixed_component_extruders(m_mixed_filament_mgr, static_cast<unsigned int>(state_idx),
+                                                     num_physical_extruders, painting_extruders);
+                } else
+                    ++dropped_painted_states;
             }
+            std::sort(painting_extruders.begin(), painting_extruders.end());
+            painting_extruders.erase(std::unique(painting_extruders.begin(), painting_extruders.end()), painting_extruders.end());
+            if (dropped_painted_states > 0)
+                BOOST_LOG_TRIVIAL(warning) << "Prusa Colorin: dropping painted extruder IDs above available filament range"
+                                           << " dropped_states=" << dropped_painted_states
+                                           << " physical_filaments=" << num_physical_extruders
+                                           << " total_filaments=" << num_total_filaments;
 
             // Expand virtual extruder IDs to their physical components.
             // PaintedRegions will be created only for physical extruder IDs.
