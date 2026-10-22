@@ -55,16 +55,38 @@ jobs:
           Copy-Item -Recurse -Force "$env:GITHUB_WORKSPACE\colorin\prusa_2.9.6\src\*" "C:\ps\src\"
           Get-ChildItem "$env:GITHUB_WORKSPACE\colorin\prusa_2.9.6" -Recurse -File | ForEach-Object { Write-Host "Reemplazado: $($_.Name)" }
 
-      - name: Compilar dependencias y programa
-        id: cache-check
+      - name: Compilar librerias (solo si no estan guardadas)
         shell: cmd
         working-directory: C:\ps
         run: |
           if exist C:\psdeps\NUL (
-            call build_win.bat -d=%DEPS% -c=Release -s=app
+            echo Librerias ya guardadas, no se recompilan.
           ) else (
-            call build_win.bat -d=%DEPS% -c=Release -s=all
+            call build_win.bat -d=%DEPS% -c=Release -s=deps
           )
+
+      - name: Configurar Prusa Colorin
+        shell: pwsh
+        run: |
+          # Busca la carpeta de librerias compiladas (usr\local), segun la documentacion de PrusaSlicer.
+          $prefix = Get-ChildItem C:\psdeps -Directory -Recurse -Depth 4 -Filter local |
+                    Where-Object { $_.Parent.Name -eq 'usr' } | Select-Object -First 1
+          if (-not $prefix) { Write-Error "No se encontro la carpeta usr\local de las librerias"; exit 1 }
+          Write-Host "Librerias: $($prefix.FullName)"
+          cmake -S C:\ps -B C:\ps\build -G "Visual Studio 17 2022" -A x64 "-DCMAKE_PREFIX_PATH=$($prefix.FullName)"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Revisar nucleo (libslic3r)
+        shell: pwsh
+        run: |
+          cmake --build C:\ps\build --config Release --target libslic3r -- /m /v:minimal
+          if ($LASTEXITCODE -ne 0) { Write-Error "ERROR EN EL NUCLEO: copiar las lineas con 'error' de este paso"; exit 1 }
+
+      - name: Compilar programa completo
+        shell: pwsh
+        run: |
+          cmake --build C:\ps\build --config Release -- /m /v:minimal
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Empaquetar portable
         shell: pwsh
