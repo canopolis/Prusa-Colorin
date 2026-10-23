@@ -1725,7 +1725,11 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                 if (!used_facet_states[state_idx])
                     continue;
                 if (state_idx <= num_total_filaments) {
-                    painting_extruders.emplace_back(static_cast<unsigned int>(state_idx));
+                    // Phase 4b-3: mixed channels are resolved onto their physical filaments layer by layer
+                    // (colorin_resolve_mixed_channels), so only physical IDs need painted regions for now.
+                    // A region for the mixed ID itself returns with the Local-Z / perimeter-modulation port.
+                    if (state_idx <= num_physical_extruders)
+                        painting_extruders.emplace_back(static_cast<unsigned int>(state_idx));
                     append_mixed_component_extruders(m_mixed_filament_mgr, static_cast<unsigned int>(state_idx),
                                                      num_physical_extruders, painting_extruders);
                 } else
