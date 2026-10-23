@@ -51,6 +51,10 @@ jobs:
                    ForEach-Object { $_.FullName.Substring("$env:GITHUB_WORKSPACE\colorin\libslic3r\".Length).Replace('\','/') }
           $lines = "`ntarget_sources(libslic3r PRIVATE`n" + (($files | ForEach-Object { "    $_" }) -join "`n") + "`n)`n"
           Add-Content -Path "C:\ps\src\libslic3r\CMakeLists.txt" -Value $lines
+          # Sin cabeceras precompiladas (por sccache): se fuerza la misma cabecera que PrusaSlicer
+          # inyectaba con FORCEINCLUDE, para que cada archivo vea exactamente las mismas inclusiones.
+          Add-Content -Path "C:\ps\src\libslic3r\CMakeLists.txt" -Value 'target_compile_options(libslic3r PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/FI${CMAKE_CURRENT_SOURCE_DIR}/pchheader.hpp>")'
+          Add-Content -Path "C:\ps\src\slic3r\CMakeLists.txt" -Value 'target_compile_options(libslic3r_gui PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/FI${CMAKE_CURRENT_SOURCE_DIR}/pchheader.hpp>")'
           Write-Host "Archivos del motor agregados: $($files.Count)"
 
       - name: Aplicar cambios de Prusa Colorin a PrusaSlicer 2.9.6
