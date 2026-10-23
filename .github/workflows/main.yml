@@ -17,13 +17,12 @@ jobs:
       - name: Repo Prusa Colorin
         uses: actions/checkout@v4
 
-      - name: Ultima version estable de PrusaSlicer
+      - name: Version base fija de PrusaSlicer
         id: ver
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          TAG=$(gh release list -R prusa3d/PrusaSlicer --exclude-pre-releases --exclude-drafts --limit 1 --json tagName -q '.[0].tagName')
+          # Version base fijada. Solo cambia cuando Arturo lo decida.
+          TAG=version_2.9.6
           echo "Version base: $TAG"
           echo "tag=$TAG" >> $GITHUB_OUTPUT
 
@@ -39,11 +38,74 @@ jobs:
           path: C:\psdeps
           key: psdeps-${{ steps.ver.outputs.tag }}-v1
 
-      - name: Compilar dependencias y programa
+      - name: Insertar motor de color (Prusa Colorin)
+        shell: pwsh
+        run: |
+          Copy-Item -Recurse -Force "$env:GITHUB_WORKSPACE\colorin\libslic3r\*" "C:\ps\src\libslic3r\"
+          $files = Get-ChildItem "$env:GITHUB_WORKSPACE\colorin\libslic3r" -Recurse -Include *.cpp,*.hpp,*.h |
+                   ForEach-Object { $_.FullName.Substring("$env:GITHUB_WORKSPACE\colorin\libslic3r\".Length).Replace('\','/') }
+          $lines = "`ntarget_sources(libslic3r PRIVATE`n" + (($files | ForEach-Object { "    $_" }) -join "`n") + "`n)`n"
+          Add-Content -Path "C:\ps\src\libslic3r\CMakeLists.txt" -Value $lines
+          Write-Host "Archivos del motor agregados: $($files.Count)"
+
+      - name: Aplicar cambios de Prusa Colorin a PrusaSlicer 2.9.6
+        shell: pwsh
+        run: |
+          # Archivos de PrusaSlicer 2.9.6 ya modificados para el motor de color.
+          Copy-Item -Recurse -Force "$env:GITHUB_WORKSPACE\colorin\prusa_2.9.6\src\*" "C:\ps\src\"
+          Copy-Item -Force "$env:GITHUB_WORKSPACE\colorin\prusa_2.9.6\CMakeLists.txt" "C:\ps\CMakeLists.txt"
+          Get-ChildItem "$env:GITHUB_WORKSPACE\colorin\prusa_2.9.6" -Recurse -File | ForEach-Object { Write-Host "Reemplazado: $($_.Name)" }
+
+      - name: Compilar librerias (solo si no estan guardadas)
         shell: cmd
         working-directory: C:\ps
         run: |
-          call build_win.bat -d=%DEPS% -c=Release -s=all
+          if exist C:\psdeps\NUL (
+            echo Librerias ya guardadas, no se recompilan.
+          ) else (
+            call build_win.bat -d=%DEPS% -c=Release -s=deps
+          )
+
+      - name: Preparar compilador de Visual Studio
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Preparar cache de compilacion (sccache)
+        uses: mozilla-actions/sccache-action@v0.0.4
+
+      - name: Configurar Prusa Colorin
+        shell: pwsh
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+        run: |
+          # Busca la carpeta de librerias compiladas (usr\local), segun la documentacion de PrusaSlicer.
+          $prefix = Get-ChildItem C:\psdeps -Directory -Recurse -Depth 4 -Filter local |
+                    Where-Object { $_.Parent.Name -eq 'usr' } | Select-Object -First 1
+          if (-not $prefix) { Write-Error "No se encontro la carpeta usr\local de las librerias"; exit 1 }
+          Write-Host "Librerias: $($prefix.FullName)"
+          # Ninja + sccache: solo se recompila lo que cambio. Sin cabeceras precompiladas (sccache no las admite en MSVC).
+          cmake -S C:\ps -B C:\ps\build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSLIC3R_PCH=OFF `
+                "-DCMAKE_PREFIX_PATH=$($prefix.FullName)" `
+                -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Revisar nucleo (libslic3r)
+        shell: pwsh
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+        run: |
+          cmake --build C:\ps\build --target libslic3r
+          if ($LASTEXITCODE -ne 0) { Write-Error "ERROR EN EL NUCLEO: copiar las lineas con 'error' de este paso"; exit 1 }
+
+      - name: Compilar programa completo
+        shell: pwsh
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+        run: |
+          cmake --build C:\ps\build
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          sccache --show-stats
 
       - name: Empaquetar portable
         shell: pwsh
@@ -52,7 +114,9 @@ jobs:
           if (-not $exe) { $exe = Get-ChildItem -Path C:\ps\build -Recurse -Filter "PrusaSlicer.exe" | Select-Object -First 1 }
           if (-not $exe) { Write-Error "No se encontro el ejecutable"; exit 1 }
           Write-Host "Ejecutable: $($exe.FullName)"
-          Compress-Archive -Path "$($exe.DirectoryName)\*" -DestinationPath "PrusaColorin-portable.zip"
+          # Solo los archivos de la carpeta del ejecutable (exe y dll), sin las carpetas intermedias de compilacion.
+          $files = Get-ChildItem -Path $exe.DirectoryName -File | Where-Object { $_.Extension -in '.exe', '.dll' }
+          Compress-Archive -Path $files.FullName -DestinationPath "PrusaColorin-portable.zip"
 
       - name: Subir resultado
         uses: actions/upload-artifact@v4
