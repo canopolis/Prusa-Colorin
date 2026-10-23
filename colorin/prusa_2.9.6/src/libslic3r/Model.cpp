@@ -64,6 +64,7 @@ Model& Model::assign_copy(const Model &rhs)
     this->wipe_tower_vector = rhs.wipe_tower_vector;
     this->sla_workflow_uuid = rhs.sla_workflow_uuid;
     this->virtual_extruders = rhs.virtual_extruders;
+    this->colorin_metadata = rhs.colorin_metadata; // Prusa Colorin (FullSpectrum)
 
     return *this;
 }
@@ -89,6 +90,7 @@ Model& Model::assign_copy(Model &&rhs)
     this->wipe_tower_vector = rhs.wipe_tower_vector;
     this->sla_workflow_uuid = rhs.sla_workflow_uuid;
     this->virtual_extruders = std::move(rhs.virtual_extruders);
+    this->colorin_metadata = std::move(rhs.colorin_metadata); // Prusa Colorin (FullSpectrum)
 
     return *this;
 }

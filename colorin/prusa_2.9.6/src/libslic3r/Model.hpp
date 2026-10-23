@@ -1276,6 +1276,8 @@ public:
     ModelObjectPtrs     objects;
     // Virtual extruder definitions. Empty when no virtual extruders are defined.
     FullSpectrum::VirtualExtruders virtual_extruders;
+    // Prusa Colorin (FullSpectrum): FullSpectrum 3MF metadata (stable ids, preserved parts, import status).
+    std::map<std::string, std::string> colorin_metadata;
 
     ModelWipeTower& wipe_tower();
     const ModelWipeTower& wipe_tower() const;

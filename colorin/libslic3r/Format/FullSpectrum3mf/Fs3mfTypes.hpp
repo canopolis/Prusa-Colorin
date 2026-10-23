@@ -1,0 +1,368 @@
+#ifndef slic3r_FullSpectrum3mf_Types_hpp_
+#define slic3r_FullSpectrum3mf_Types_hpp_
+
+#include <map>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace Slic3r::FullSpectrum3mf {
+
+struct Checksum
+{
+    std::string algorithm = "sha256";
+    std::string value;
+};
+
+struct ManifestPart
+{
+    std::string role;
+    std::string path;
+    std::string content_type;
+    bool        required = false;
+    Checksum    checksum;
+};
+
+struct LegacyProjection
+{
+    bool                     present = false;
+    std::string              non_fullspectrum_policy = "physical-filaments-only";
+    std::vector<std::string> derived_from;
+    std::vector<std::string> paths;
+};
+
+struct Manifest
+{
+    std::string                         kind;
+    std::string                         schema_version;
+    std::string                         document_class = "project";
+    std::string                         package_id;
+    std::vector<std::string>            required_features;
+    std::vector<std::string>            optional_features;
+    std::vector<ManifestPart>           parts;
+    std::map<std::string, std::string>  authoritative_sources;
+    LegacyProjection                    legacy_projection;
+};
+
+struct Project
+{
+    std::string kind;
+    std::string schema_version;
+    std::string project_id;
+    std::string display_name;
+    bool        legacy_projection_written = true;
+};
+
+struct PhysicalFilament
+{
+    std::string id;
+    std::string display_name;
+    std::string material_family;
+    double      diameter_mm = 1.75;
+    std::string color = "#FFFFFF";
+    size_t      source_index = 0;
+};
+
+struct Materials
+{
+    std::string                   kind;
+    std::string                   schema_version;
+    std::vector<PhysicalFilament> physical_filaments;
+};
+
+struct ModelObjectBinding
+{
+    int         model_object_id = 0;
+    std::string stable_object_id;
+};
+
+struct VolumeBinding
+{
+    int         model_object_id = 0;
+    int         model_volume_id = 0;
+    std::string stable_object_id;
+    std::string stable_volume_id;
+};
+
+struct MaterialBinding
+{
+    int         runtime_filament_id = 0;
+    std::string material_ref;
+};
+
+struct MixedFilamentBinding
+{
+    int         runtime_filament_id = 0;
+    uint64_t    legacy_stable_id = 0;
+    std::string material_ref;
+};
+
+struct IdentityMap
+{
+    std::string                       kind;
+    std::string                       schema_version;
+    std::vector<ModelObjectBinding>   model_object_bindings;
+    std::vector<VolumeBinding>        volume_bindings;
+    std::vector<MaterialBinding>      material_bindings;
+    std::vector<MixedFilamentBinding> mixed_filament_bindings;
+};
+
+struct AssignmentTarget
+{
+    std::string kind;
+    std::string stable_object_id;
+    std::string stable_volume_id;
+    std::string stable_region_id;
+};
+
+struct Assignment
+{
+    std::string      id;
+    AssignmentTarget target;
+    std::string      material_ref;
+};
+
+struct PaintStateBinding
+{
+    std::string stable_volume_id;
+    int         paint_state = 0;
+    std::string material_ref;
+};
+
+struct Assignments
+{
+    std::string                   kind;
+    std::string                   schema_version;
+    std::vector<Assignment>       assignments;
+    std::vector<PaintStateBinding> paint_state_bindings;
+};
+
+struct MixedFilamentOrigin
+{
+    std::string              kind = "pair";
+    std::vector<std::string> component_refs;
+    bool                     origin_auto_generated = false;
+};
+
+struct MixedFilamentBlend
+{
+    std::string type = "pair_ratio";
+    int         component_b_percent = 50;
+};
+
+struct MixedFilamentDistribution
+{
+    std::string mode = "simple";
+};
+
+struct ManualPattern
+{
+    std::vector<std::vector<std::string>> groups;
+};
+
+struct Gradient
+{
+    std::vector<std::string> component_refs;
+    std::vector<int>         weights;
+    bool                     enabled = false;
+    double                   component_a_start = 0.99;
+    double                   component_a_end = 0.01;
+    std::vector<double>      stop_positions;
+    std::vector<double>      solid_widths;
+};
+
+struct SurfaceBias
+{
+    // Explicit per-component form. Refs and offsets are parallel arrays.
+    std::vector<std::string> component_refs;
+    std::vector<double>      component_offsets_mm;
+    // Pair fields remain for Profile v1 and older readers.
+    double component_a_offset_mm = 0.0;
+    double component_b_offset_mm = 0.0;
+    // "region_mask" is the ordinary mixed-filament bias path.
+    // "external_perimeter" preserves the region and moves only its visible
+    // external-perimeter centerline at constant extrusion width.
+    std::string application = "region_mask";
+};
+
+struct LocalZ
+{
+    int         max_sublayers = 0;
+    std::string strategy = "standard-pair-split";
+};
+
+struct VirtualFilament
+{
+    std::string                         id;
+    uint64_t                            legacy_stable_id = 0;
+    std::string                         visibility_state = "active";
+    std::string                         source_kind = "auto";
+    MixedFilamentOrigin                 origin;
+    MixedFilamentBlend                  blend;
+    MixedFilamentDistribution           distribution;
+    std::optional<ManualPattern>        manual_pattern;
+    std::optional<Gradient>             gradient;
+    SurfaceBias                         surface_bias;
+    std::optional<LocalZ>               local_z;
+};
+
+struct MixedFilaments
+{
+    std::string                  kind;
+    std::string                  schema_version;
+    std::vector<VirtualFilament> virtual_filaments;
+};
+
+struct ImageMapTextureAsset
+{
+    std::string id;
+    std::string display_name;
+    std::string path;
+    uint32_t    width = 0;
+    uint32_t    height = 0;
+};
+
+struct ImageMapSurfaceSource
+{
+    std::string         kind = "face_color";
+    std::string         texture_asset_ref;
+    std::string         wrap_u = "repeat";
+    std::string         wrap_v = "repeat";
+    std::vector<double> uvs;
+    std::vector<double> corner_rgba;
+};
+
+struct ImageMapTriangleBinding
+{
+    uint32_t              triangle_index = 0;
+    uint32_t              zone_index = 0;
+    ImageMapSurfaceSource source;
+};
+
+struct ImageMapPaletteEntry
+{
+    std::vector<double> target_rgba;
+    std::string         material_ref;
+    int                 fallback_runtime_filament_id = 1;
+};
+
+struct ImageMapZone
+{
+    std::string                       id;
+    std::string                       display_name;
+    bool                              enabled = true;
+    int                               priority = 0;
+    std::string                       render_mode = "normal_mix";
+    std::string                       adaptive_modulation_mode = "perimeter";
+    std::string                       color_mix_model = "full_spectrum_km_ks";
+    bool                              synchronize_whole_object_cadence = false;
+    int                               minimum_component_percent = 15;
+    double                            target_sample_size_mm = 0.4;
+    uint64_t                          max_facet_samples = 200000;
+    double                            modulation_sample_spacing_mm = 0.16;
+    double                            corner_smoothing_radius_mm = 0.6;
+    bool                              disable_broad_path_smoothing = false;
+    double                            gaussian_smoothing_strength = 1.0;
+    double                            first_path_smoothing_strength = 1.0;
+    double                            second_path_smoothing_strength = 1.0;
+    double                            tone_gamma = 1.0;
+    double                            overhang_contrast_percent = 100.0;
+    double                            image_exposure_ev = 0.0;
+    double                            image_contrast_percent = 100.0;
+    double                            image_saturation_percent = 100.0;
+    double                            image_edge_boost_percent = 0.0;
+    std::vector<ImageMapPaletteEntry> palette;
+};
+
+struct ImageMapVolume
+{
+    std::string                          stable_volume_id;
+    uint64_t                             topology_fingerprint = 0;
+    std::vector<ImageMapZone>            zones;
+    std::vector<ImageMapTriangleBinding> triangle_bindings;
+};
+
+struct ImageMaps
+{
+    std::string                       kind;
+    std::string                       schema_version;
+    std::vector<ImageMapTextureAsset> texture_assets;
+    std::vector<ImageMapVolume>       volumes;
+};
+
+struct ImageMapAssetPart
+{
+    std::string path;
+    std::string content_type;
+    std::string bytes;
+};
+
+struct PreservedPart
+{
+    std::string path;
+    std::string content_type;
+    std::string role;
+    std::string bytes;
+    bool        required = false;
+    bool        must_preserve = true;
+};
+
+struct PackageModel
+{
+    Manifest                      manifest;
+    Project                       project;
+    IdentityMap                   identity_map;
+    Materials                     materials;
+    Assignments                   assignments;
+    std::optional<MixedFilaments> mixed_filaments;
+    std::optional<ImageMaps>      image_maps;
+    std::vector<ImageMapAssetPart> image_map_assets;
+    std::vector<PreservedPart>    preserved_parts;
+    // Serialized image_maps JSON, computed once and reused (large meshes).
+    std::string                   image_maps_json;
+    // SHA-256 of image_maps_json, cached with it.
+    std::string                   image_maps_sha256;
+};
+
+struct PackagePartPlan
+{
+    std::string path;
+    std::string content_type;
+    std::string role;
+    std::string bytes;
+    bool        required = false;
+    bool        must_preserve = false;
+    // Optional precomputed SHA-256 of bytes (empty = compute when needed).
+    std::string sha256;
+};
+
+struct PackageRelationshipPlan
+{
+    std::string target;
+    std::string type;
+    std::string source;
+};
+
+struct PackageWritePlan
+{
+    std::vector<PackagePartPlan>         parts;
+    std::vector<PreservedPart>           preserved_parts;
+    std::vector<PackageRelationshipPlan> relationships;
+    std::vector<std::string>             required_features;
+    std::vector<std::string>             optional_features;
+};
+
+struct FeatureNegotiationResult
+{
+    bool                     can_edit = true;
+    bool                     can_slice = true;
+    bool                     can_print = true;
+    bool                     should_preserve_only = false;
+    std::vector<std::string> unsupported_required_features;
+    std::vector<std::string> unsupported_optional_features;
+    std::vector<std::string> warnings;
+};
+
+} // namespace Slic3r::FullSpectrum3mf
+
+#endif
