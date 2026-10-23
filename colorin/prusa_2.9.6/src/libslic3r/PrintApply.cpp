@@ -1667,7 +1667,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             // Generate a list of trafos and XY offsets for instances of a ModelObject
             // Producing the config for PrintObject on demand, caching it at print_object_last.
             const PrintObject *print_object_last = nullptr;
-            auto print_object_apply_config = [this, &print_object_last, model_object, num_physical_extruders](PrintObject *print_object) {
+            auto print_object_apply_config = [this, &print_object_last, model_object, num_total_filaments](PrintObject *print_object) { // Prusa Colorin (FullSpectrum)
                 print_object->config_apply(print_object_last ?
                     print_object_last->config() :
                     PrintObject::object_config_from_model_object(m_default_object_config, *model_object, num_total_filaments));
