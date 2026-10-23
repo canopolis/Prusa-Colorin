@@ -16,6 +16,7 @@ jobs:
       # (el servicio de cache directo de sccache en GitHub no esta disponible).
       SCCACHE_DIR: C:\sccache
       SCCACHE_CACHE_SIZE: 5G
+      SCCACHE_GHA_ENABLED: "false"
 
     steps:
       - name: Repo Prusa Colorin
