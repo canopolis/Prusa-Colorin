@@ -12,6 +12,10 @@ jobs:
     env:
       SRC: C:\ps
       DEPS: C:\psdeps
+      # Cache de compilacion en disco, guardada entre ejecuciones con actions/cache
+      # (el servicio de cache directo de sccache en GitHub no esta disponible).
+      SCCACHE_DIR: C:\sccache
+      SCCACHE_CACHE_SIZE: 5G
 
     steps:
       - name: Repo Prusa Colorin
@@ -74,10 +78,16 @@ jobs:
       - name: Preparar cache de compilacion (sccache)
         uses: mozilla-actions/sccache-action@v0.0.4
 
+      - name: Recuperar cache de compilacion
+        uses: actions/cache@v4
+        with:
+          path: C:\sccache
+          key: sccache-${{ steps.ver.outputs.tag }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-${{ steps.ver.outputs.tag }}-
+
       - name: Configurar Prusa Colorin
         shell: pwsh
-        env:
-          SCCACHE_GHA_ENABLED: "true"
         run: |
           # Busca la carpeta de librerias compiladas (usr\local), segun la documentacion de PrusaSlicer.
           $prefix = Get-ChildItem C:\psdeps -Directory -Recurse -Depth 4 -Filter local |
@@ -92,16 +102,12 @@ jobs:
 
       - name: Revisar nucleo (libslic3r)
         shell: pwsh
-        env:
-          SCCACHE_GHA_ENABLED: "true"
         run: |
           cmake --build C:\ps\build --target libslic3r
           if ($LASTEXITCODE -ne 0) { Write-Error "ERROR EN EL NUCLEO: copiar las lineas con 'error' de este paso"; exit 1 }
 
       - name: Compilar programa completo
         shell: pwsh
-        env:
-          SCCACHE_GHA_ENABLED: "true"
         run: |
           cmake --build C:\ps\build
           if ($LASTEXITCODE -ne 0) { exit 1 }
