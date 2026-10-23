@@ -1206,6 +1206,59 @@ static void append_mixed_component_extruders(const MixedFilamentManager &mixed_m
         append_unique_painted_extruder(painting_extruders, extruder_id, num_physical_extruders);
 }
 
+// Prusa Colorin (FullSpectrum)
+// Collects the filaments referenced by a volume's image-map palette (OrcaSlicer FullSpectrum
+// append_image_map_painted_extruders). As in phase 4b-3, mixed IDs contribute their physical
+// components; the mixed ID region itself returns with the Local-Z / perimeter-modulation port.
+static size_t append_image_map_painted_extruders(const ModelVolume&           volume,
+                                                 const MixedFilamentManager& mixed_mgr,
+                                                 size_t                      num_physical_extruders,
+                                                 size_t                      num_total_filaments,
+                                                 std::vector<unsigned int>&  painting_extruders)
+{
+    const std::shared_ptr<const ImageMap::VolumeData> data = volume.image_map_data();
+    if (!data || data->empty())
+        return 0;
+
+    std::vector<bool> referenced_zones(data->zones.size(), false);
+    for (const ImageMap::TriangleBinding& binding : data->triangle_bindings) {
+        if (binding.zone_index < referenced_zones.size())
+            referenced_zones[binding.zone_index] = true;
+    }
+
+    size_t unresolved = 0;
+    for (size_t zone_idx = 0; zone_idx < data->zones.size(); ++zone_idx) {
+        const ImageMap::Zone& zone = data->zones[zone_idx];
+        if (!referenced_zones[zone_idx] || !zone.enabled)
+            continue;
+        if (zone.render_mode == ImageMap::RenderMode::PerimeterModulationV2 && zone.synchronize_whole_object_cadence)
+            continue;
+        if (zone.render_mode == ImageMap::RenderMode::AdaptiveLocalizedCycles) {
+            for (unsigned int extruder_id = 1; extruder_id <= num_physical_extruders; ++extruder_id)
+                append_unique_painted_extruder(painting_extruders, extruder_id, num_physical_extruders);
+        }
+        for (const ImageMap::PaletteEntry& entry : zone.palette) {
+            unsigned int filament_id = 0;
+            if (entry.mixed_filament_stable_id != 0) {
+                const std::optional<unsigned int> stable =
+                    mixed_mgr.filament_id_from_stable_id(entry.mixed_filament_stable_id, num_physical_extruders);
+                if (stable && *stable >= 1 && *stable <= num_total_filaments)
+                    filament_id = *stable;
+            }
+            if (filament_id == 0 && entry.fallback_filament_id >= 1 && entry.fallback_filament_id <= num_total_filaments)
+                filament_id = entry.fallback_filament_id;
+            if (filament_id == 0) {
+                ++unresolved;
+                continue;
+            }
+            if (filament_id <= num_physical_extruders)
+                painting_extruders.emplace_back(filament_id);
+            append_mixed_component_extruders(mixed_mgr, filament_id, num_physical_extruders, painting_extruders);
+        }
+    }
+    return unresolved;
+}
+
 Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_config, std::vector<std::string> *warnings, const DynamicPrintConfig* original_config)
 {
 #ifdef _DEBUG
@@ -1485,6 +1538,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         // Only volume IDs, volume types, transformation matrices and their order are checked, configuration and other parameters are NOT checked.
         bool solid_or_modifier_differ   = model_volume_list_changed(model_object, model_object_new, solid_or_modifier_types) ||
                                           model_mmu_segmentation_data_changed(model_object, model_object_new) ||
+                                          model_image_map_data_changed(model_object, model_object_new) || // Prusa Colorin (FullSpectrum)
                                           (model_object_new.is_mm_painted() && num_extruders_changed) ||
                                           model_fuzzy_skin_data_changed(model_object, model_object_new);
         bool supports_differ            = model_volume_list_changed(model_object, model_object_new, ModelVolumeType::SUPPORT_BLOCKER) ||
@@ -1720,6 +1774,15 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             }
 
             // Prusa Colorin (FullSpectrum)
+            size_t unresolved_image_map_entries = 0;
+            for (const ModelVolume *volume : volumes)
+                unresolved_image_map_entries += append_image_map_painted_extruders(*volume, m_mixed_filament_mgr,
+                    num_physical_extruders, num_total_filaments, painting_extruders);
+            if (unresolved_image_map_entries > 0)
+                BOOST_LOG_TRIVIAL(warning) << "Print::apply could not resolve persistent image-map palette entries"
+                                           << " unresolved=" << unresolved_image_map_entries
+                                           << " physical_filaments=" << num_physical_extruders
+                                           << " total_filaments=" << num_total_filaments;
             size_t dropped_painted_states = 0;
             for (size_t state_idx = static_cast<size_t>(TriangleStateType::Extruder1); state_idx < used_facet_states.size(); ++state_idx) {
                 if (!used_facet_states[state_idx])
