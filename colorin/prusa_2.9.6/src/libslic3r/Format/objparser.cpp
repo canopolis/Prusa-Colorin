@@ -6,7 +6,7 @@
 
 #include "objparser.hpp"
 
-#include "libslic3r/LocalesUtils.hpp"
+#include <LocalesUtils.hpp> // Prusa Colorin (FullSpectrum) PrusaSlicer keeps it in bundled_deps
 
 namespace ObjParser {
 #define EATWS()  while (*line == ' ' || *line == '\t') ++line

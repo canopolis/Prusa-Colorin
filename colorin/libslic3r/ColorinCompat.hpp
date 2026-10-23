@@ -11,6 +11,8 @@ namespace Slic3r {
 
 // OrcaSlicer defines RGBA in Color.hpp; PrusaSlicer does not. Re-declaring the same alias is legal C++.
 using RGBA = std::array<float, 4>;
+// OrcaSlicer Color.hpp: const RGBA UNDEFINE_COLOR = {0,0,0,0};
+inline const RGBA UNDEFINE_COLOR = {0, 0, 0, 0};
 
 namespace Colorin {
 

@@ -1,3 +1,4 @@
+#include <boost/filesystem.hpp> // Prusa Colorin (FullSpectrum)
 #include "../libslic3r.h"
 #include "../Model.hpp"
 #include "../TriangleMesh.hpp"

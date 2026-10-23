@@ -1,5 +1,5 @@
 #include "Internal.hpp"
-#include "../LocalesUtils.hpp"
+#include <LocalesUtils.hpp> // Prusa Colorin (FullSpectrum) PrusaSlicer keeps it in bundled_deps
 #include "../libslic3r.h"
 
 #include <algorithm>
