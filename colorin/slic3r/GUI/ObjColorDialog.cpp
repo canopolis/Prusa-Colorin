@@ -1,3 +1,4 @@
+#include "slic3r/GUI/ColorinGuiCompat.hpp" // Prusa Colorin
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -60,7 +61,7 @@ static wxPanel* buildAPMRow(wxWindow* parent,
                             size_t max_swatch_slots = 0)
 {
     auto* row_panel = new wxPanel(parent, wxID_ANY);
-    row_panel->SetBackgroundColour(parent ? parent->GetBackgroundColour() : StateColor::darkModeColorFor(*wxWHITE));
+    row_panel->SetBackgroundColour(parent ? parent->GetBackgroundColour() : colorin_dark_mode_color_for(*wxWHITE));
     auto* sizer = new wxBoxSizer(wxHORIZONTAL);
 
     if (max_swatch_slots > 0) {
@@ -109,7 +110,7 @@ static wxPanel* buildAPMRow(wxWindow* parent,
         dc.SetBrush(wxBrush(spectrum_panel->GetParent()->GetBackgroundColour()));
         dc.DrawRectangle(0, 0, size.x, size.y);
 
-        const std::vector<wxColour> fallback{StateColor::darkModeColorFor(wxColour("#808080"))};
+        const std::vector<wxColour> fallback{colorin_dark_mode_color_for(wxColour("#808080"))};
         const std::vector<wxColour>& spectrum = spectrum_colors.empty() ? fallback : spectrum_colors;
         std::unique_ptr<wxGraphicsContext> graphics(wxGraphicsContext::CreateFromUnknownDC(dc));
         if (graphics) {
@@ -129,7 +130,7 @@ static wxPanel* buildAPMRow(wxWindow* parent,
             }
         }
 
-        dc.SetPen(wxPen(StateColor::darkModeColorFor(wxColour("#CECECE")), 1));
+        dc.SetPen(wxPen(colorin_dark_mode_color_for(wxColour("#CECECE")), 1));
         dc.SetBrush(*wxTRANSPARENT_BRUSH);
         dc.DrawRectangle(0, 0, size.x, size.y);
 

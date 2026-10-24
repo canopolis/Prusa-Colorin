@@ -4,6 +4,7 @@
 // mixed-filament UI, and MixedColorMatchPanel. Implementations live in
 // MixedColorMatchHelpers.cpp.
 
+#include "slic3r/GUI/ColorinGuiCompat.hpp" // Prusa Colorin
 #include "libslic3r/MixedFilament.hpp"
 #include "libslic3r/Color.hpp"
 #include "libslic3r/ImageMap/VolumeData.hpp"
