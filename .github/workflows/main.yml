@@ -59,6 +59,11 @@ jobs:
           Add-Content -Path "C:\ps\src\libslic3r\CMakeLists.txt" -Value 'set(OpenCV_STATIC ON)'
           Add-Content -Path "C:\ps\src\libslic3r\CMakeLists.txt" -Value 'find_package(OpenCV REQUIRED core)'
           Add-Content -Path "C:\ps\src\libslic3r\CMakeLists.txt" -Value 'target_link_libraries(libslic3r PUBLIC opencv_world)'
+          # Prusa Colorin: recursos (por ejemplo filament_compatibility.json de Orca).
+          if (Test-Path "$env:GITHUB_WORKSPACE\colorin\resources") {
+            Copy-Item -Recurse -Force "$env:GITHUB_WORKSPACE\colorin\resources\*" "C:\ps\resources\"
+            Write-Host "Recursos de Prusa Colorin agregados"
+          }
           # Prusa Colorin: archivos de interfaz (ventana de color de OBJ y sus controles).
           if (Test-Path "$env:GITHUB_WORKSPACE\colorin\slic3r") {
             Copy-Item -Recurse -Force "$env:GITHUB_WORKSPACE\colorin\slic3r\*" "C:\ps\src\slic3r\"
