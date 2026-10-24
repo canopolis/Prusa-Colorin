@@ -2,7 +2,7 @@
 #include "MixedGradientSelector.hpp"
 #include <unordered_map>
 #include <unordered_set>
-#include <ColorSpaceConvert.hpp>
+#include "slic3r/Utils/ColorSpaceConvert.hpp"
 #include "MixedFilamentColorMapPanel.hpp"
 #include "libslic3r/FullSpectrumKSPairResidual.hpp"
 #include "libslic3r/ImageMap/ContinuousColorSolver.hpp"
