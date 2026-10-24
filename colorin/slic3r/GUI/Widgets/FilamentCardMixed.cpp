@@ -1,3 +1,4 @@
+#include "slic3r/GUI/ColorinGuiCompat.hpp" // Prusa Colorin
 #include "FilamentCardMixed.hpp"
 
 #include "slic3r/GUI/Plater.hpp"
@@ -33,7 +34,7 @@ FilamentCardMixed::FilamentCardMixed(wxWindow*                                  
     , m_definition{definition}
     , m_physical_filaments{physical_filaments}
 {
-    SetBackgroundColour(parent ? parent->GetBackgroundColour() : StateColor::darkModeColorFor(*wxWHITE));
+    SetBackgroundColour(parent ? parent->GetBackgroundColour() : colorin_dark_mode_color_for(*wxWHITE));
     build_ui();
     update_state(definition, false);
 }
@@ -67,7 +68,7 @@ FilamentCardImageMap::FilamentCardImageMap(wxWindow*             parent,
     , m_component_filaments(std::move(component_filaments))
     , m_show_delete(show_delete)
 {
-    SetBackgroundColour(parent ? parent->GetBackgroundColour() : StateColor::darkModeColorFor(*wxWHITE));
+    SetBackgroundColour(parent ? parent->GetBackgroundColour() : colorin_dark_mode_color_for(*wxWHITE));
     build_ui();
 }
 
@@ -144,7 +145,7 @@ void FilamentCardImageMap::paint_spectrum(wxPaintEvent&)
     dc.SetBrush(wxBrush(GetBackgroundColour()));
     dc.DrawRectangle(0, 0, size.x, size.y);
 
-    const std::vector<wxColour>        fallback{StateColor::darkModeColorFor(wxColour("#808080"))};
+    const std::vector<wxColour>        fallback{colorin_dark_mode_color_for(wxColour("#808080"))};
     const std::vector<wxColour>&       spectrum = m_spectrum_colors.empty() ? fallback : m_spectrum_colors;
     std::unique_ptr<wxGraphicsContext> graphics(wxGraphicsContext::CreateFromUnknownDC(dc));
     if (graphics) {
@@ -164,8 +165,8 @@ void FilamentCardImageMap::paint_spectrum(wxPaintEvent&)
         }
     }
 
-    const wxColour selected_color(ColorRGB::ORCA().r_uchar(), ColorRGB::ORCA().g_uchar(), ColorRGB::ORCA().b_uchar());
-    dc.SetPen(wxPen(m_selected ? selected_color : StateColor::darkModeColorFor(wxColour("#CECECE")), m_selected ? 3 : 1));
+    const wxColour selected_color(colorin_orca_rgb().r_uchar(), colorin_orca_rgb().g_uchar(), colorin_orca_rgb().b_uchar());
+    dc.SetPen(wxPen(m_selected ? selected_color : colorin_dark_mode_color_for(wxColour("#CECECE")), m_selected ? 3 : 1));
     dc.SetBrush(*wxTRANSPARENT_BRUSH);
     const int border_inset = m_selected ? 1 : 0;
     dc.DrawRectangle(border_inset, border_inset, size.x - 2 * border_inset, size.y - 2 * border_inset);
@@ -646,8 +647,8 @@ void FilamentCardMixed::paint_box_mix(wxDC&                            context,
     // border (draw last, so its on top)
     const int     border_width = 1;
     const wxColor border_color = is_hovered ?
-                                     wxColor(ColorRGB::ORCA().r_uchar(), ColorRGB::ORCA().g_uchar(), ColorRGB::ORCA().b_uchar(), 1) :
-                                     StateColor::darkModeColorFor(wxColour("#CECECE"));
+                                     wxColor(colorin_orca_rgb().r_uchar(), colorin_orca_rgb().g_uchar(), colorin_orca_rgb().b_uchar(), 1) :
+                                     colorin_dark_mode_color_for(wxColour("#CECECE"));
 
     context.SetBrush(*wxTRANSPARENT_BRUSH);
     context.SetPen(wxPen(border_color, border_width));
@@ -746,8 +747,8 @@ void FilamentCardMixed::paint_box_pattern(wxDC&                            conte
     // border (draw last, so its on top)
     const int     border_width = 1;
     const wxColor border_color = is_hovered ?
-                                     wxColor(ColorRGB::ORCA().r_uchar(), ColorRGB::ORCA().g_uchar(), ColorRGB::ORCA().b_uchar(), 1) :
-                                     StateColor::darkModeColorFor(wxColour("#CECECE"));
+                                     wxColor(colorin_orca_rgb().r_uchar(), colorin_orca_rgb().g_uchar(), colorin_orca_rgb().b_uchar(), 1) :
+                                     colorin_dark_mode_color_for(wxColour("#CECECE"));
 
     context.SetBrush(*wxTRANSPARENT_BRUSH);
     context.SetPen(wxPen(border_color, border_width));
@@ -786,8 +787,8 @@ void FilamentCardMixed::update_state(MixedFilamentDefinition* definition, bool r
                 }
             }
             if (m_gradient_preview_colors.empty()) {
-                m_gradient_preview_colors = {StateColor::darkModeColorFor(wxColour("#808080")),
-                                             StateColor::darkModeColorFor(wxColour("#B0B0B0"))};
+                m_gradient_preview_colors = {colorin_dark_mode_color_for(wxColour("#808080")),
+                                             colorin_dark_mode_color_for(wxColour("#B0B0B0"))};
             }
         }
 
@@ -893,8 +894,8 @@ void FilamentCardMixed::paint_box_gradient(wxDC&                            cont
     if (colors.empty()) {
         const int     border_width = 1;
         const wxColor border_color = is_hovered ?
-                                         wxColor(ColorRGB::ORCA().r_uchar(), ColorRGB::ORCA().g_uchar(), ColorRGB::ORCA().b_uchar(), 1) :
-                                         StateColor::darkModeColorFor(wxColour("#CECECE"));
+                                         wxColor(colorin_orca_rgb().r_uchar(), colorin_orca_rgb().g_uchar(), colorin_orca_rgb().b_uchar(), 1) :
+                                         colorin_dark_mode_color_for(wxColour("#CECECE"));
         context.SetBrush(*wxTRANSPARENT_BRUSH);
         context.SetPen(wxPen(border_color, border_width));
         context.DrawRectangle(0, 0, size.GetWidth(), size.GetHeight());
@@ -1004,8 +1005,8 @@ void FilamentCardMixed::paint_box_gradient(wxDC&                            cont
     // border (draw last, so its on top)
     const int     border_width = 1;
     const wxColor border_color = is_hovered ?
-                                     wxColor(ColorRGB::ORCA().r_uchar(), ColorRGB::ORCA().g_uchar(), ColorRGB::ORCA().b_uchar(), 1) :
-                                     StateColor::darkModeColorFor(wxColour("#CECECE"));
+                                     wxColor(colorin_orca_rgb().r_uchar(), colorin_orca_rgb().g_uchar(), colorin_orca_rgb().b_uchar(), 1) :
+                                     colorin_dark_mode_color_for(wxColour("#CECECE"));
 
     context.SetBrush(*wxTRANSPARENT_BRUSH);
     context.SetPen(wxPen(border_color, border_width));
