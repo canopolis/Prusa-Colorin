@@ -19,6 +19,7 @@
 ///|/
 #include "Plater.hpp"
 #include "ObjColorDialog.hpp" // Prusa Colorin (FullSpectrum)
+#include "Widgets/Label.hpp" // Prusa Colorin (FullSpectrum)
 #include "slic3r/GUI/BitmapCache.hpp"
 #include "slic3r/GUI/Jobs/UIThreadWorker.hpp"
 #include "slic3r/Utils/PrusaConnect.hpp"
@@ -1480,6 +1481,9 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         if (extruder_colours.size() > num_physical)
                             extruder_colours.resize(num_physical);
                         const std::string obj_basename = into_u8(from_path(filename));
+                        // Fuentes de los controles de Orca (Orca las inicia al arrancar; PrusaSlicer no).
+                        static const bool colorin_fonts_ready = (Label::initSysFont(), true);
+                        (void) colorin_fonts_ready;
                         ObjColorDialog color_dlg(nullptr, input_colors, is_single_color, import_context, extruder_colours, filament_ids,
                                                  first_extruder_id, obj_basename);
                         if (colorin_user_cancel) {
