@@ -48,4 +48,16 @@ wxBitmap *get_extruder_color_icon(std::string color, std::string label, int icon
 // OrcaSlicer ComboBox::SetItemTooltip: el ComboBox de PrusaSlicer no tiene tooltip por elemento.
 template<class C, class S> inline void colorin_set_item_tooltip(C *, int, const S &) {}
 
+#include "libslic3r/TriangleSelector.hpp"
+
+namespace Slic3r {
+class ModelVolume;
+// OrcaSlicer TriangleSelector.hpp: EnforcerBlockerType::ExtruderMax = 255 y EnforcerBlockerStateMap.
+// En PrusaSlicer el tipo se llama TriangleStateType.
+inline constexpr TriangleStateType COLORIN_EXTRUDER_MAX_TYPE = TriangleStateType(255);
+using EnforcerBlockerStateMap = std::array<TriangleStateType, 256>;
+// OrcaSlicer ModelVolume::remap_extruder_ids (renumera los colores pintados).
+void colorin_remap_extruder_ids(ModelVolume &mv, size_t extruder_count, const EnforcerBlockerStateMap &state_map);
+} // namespace Slic3r
+
 #endif // slic3r_ColorinGuiCompat_hpp_

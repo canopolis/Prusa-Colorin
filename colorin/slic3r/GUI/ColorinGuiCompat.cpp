@@ -4,6 +4,7 @@
 #include "GUI_App.hpp"
 #include "Plater.hpp"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/Model.hpp"
 #include "Widgets/Label.hpp"
 
 #include <map>
@@ -70,3 +71,17 @@ wxBitmap *get_extruder_color_icon(std::string color, std::string label, int icon
     bmp_cache.emplace(bitmap_key, std::move(bitmap));
     return out;
 }
+
+namespace Slic3r {
+// Equivale a OrcaSlicer ModelVolume::remap_extruder_ids + FacetsAnnotation::remap_enforcer_block_types:
+// se cargan los triangulos pintados, se cambia cada color segun state_map y se guardan.
+void colorin_remap_extruder_ids(ModelVolume &mv, size_t /*extruder_count*/, const EnforcerBlockerStateMap &state_map)
+{
+    if (mv.mm_segmentation_facets.empty())
+        return;
+    TriangleSelector selector(mv.mesh());
+    selector.deserialize(mv.mm_segmentation_facets.get_data(), false);
+    selector.remap_triangle_state(state_map);
+    mv.mm_segmentation_facets.set(selector);
+}
+} // namespace Slic3r

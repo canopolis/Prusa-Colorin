@@ -3418,17 +3418,17 @@ void apply_batch_match_to_model(const BatchMatchResult& result)
     const size_t total_filaments = pb->mixed_filaments.total_filaments(num_physical);
 
     // Build EnforcerBlockerStateMap: identity by default, remap where needed
-    constexpr size_t MAX_EBT = static_cast<size_t>(EnforcerBlockerType::ExtruderMax);
+    constexpr size_t MAX_EBT = static_cast<size_t>(COLORIN_EXTRUDER_MAX_TYPE);
     EnforcerBlockerStateMap state_map;
     for (size_t i = 0; i <= MAX_EBT; ++i)
-        state_map[i] = static_cast<EnforcerBlockerType>(i);
+        state_map[i] = static_cast<TriangleStateType>(i);
     for (const auto& [eid, target] : extruder_remap) {
         if (eid <= static_cast<int>(MAX_EBT) && target <= static_cast<unsigned int>(MAX_EBT)) {
-            state_map[static_cast<size_t>(eid)] = static_cast<EnforcerBlockerType>(target);
+            state_map[static_cast<size_t>(eid)] = static_cast<TriangleStateType>(target);
         } else if (target > static_cast<unsigned int>(MAX_EBT)) {
             BOOST_LOG_TRIVIAL(warning)
                 << "apply_batch_match: cannot remap extruder " << eid
-                << " -> " << target << " (target exceeds EnforcerBlockerType::ExtruderMax="
+                << " -> " << target << " (target exceeds COLORIN_EXTRUDER_MAX_TYPE="
                 << MAX_EBT << "), triangle-level remap skipped for this entry";
         }
     }
@@ -3477,7 +3477,7 @@ void apply_batch_match_to_model(const BatchMatchResult& result)
             // Level 1: triangle-level MMU data (MODEL_PART only — modifiers
             // carry no paint data).
             if (is_part && !mv->mmu_segmentation_facets.empty())
-                mv->remap_extruder_ids(total_filaments, state_map);
+                colorin_remap_extruder_ids(*mv, total_filaments, state_map);
 
             // Level 2: config-level extruder for parts and modifiers.
             if (!is_part && !is_modifier) continue;
