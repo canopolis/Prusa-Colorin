@@ -1,13 +1,64 @@
 #include "PerimeterModulation.hpp"
 
 #include "../libslic3r.h"
+#include "../ExPolygon.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace Slic3r {
 
 namespace {
+
+// Prusa Colorin: PrusaSlicer 2.9.6 no tiene Point::projection_onto ni
+// projection_onto(ExPolygons, Point). Copia fiel de la logica de OrcaSlicer.
+Point colorin_projection_onto_line(const Point& pt, const Point& a, const Point& b)
+{
+    if (a == b)
+        return a;
+    const double lx    = double(b.x() - a.x());
+    const double ly    = double(b.y() - a.y());
+    const double theta = (double(b.x() - pt.x()) * lx + double(b.y() - pt.y()) * ly) / (lx * lx + ly * ly);
+    if (0.0 <= theta && theta <= 1.0)
+        return Point((theta * a.cast<double>() + (1.0 - theta) * b.cast<double>()).cast<coord_t>());
+    return ((a - pt).cast<double>().squaredNorm() < (b - pt).cast<double>().squaredNorm()) ? a : b;
+}
+
+Point colorin_projection_onto_polygon(const Point& pt, const Polygon& poly)
+{
+    if (poly.points.empty())
+        return pt;
+    Point        running_projection = poly.points.front();
+    double       running_min        = (running_projection - pt).cast<double>().norm();
+    const size_t n                  = poly.points.size();
+    for (size_t i = 0; i < n; ++i) {
+        const Point  candidate = colorin_projection_onto_line(pt, poly.points[i], poly.points[(i + 1) % n]);
+        const double d         = (candidate - pt).cast<double>().norm();
+        if (d < running_min) {
+            running_projection = candidate;
+            running_min        = d;
+        }
+    }
+    return running_projection;
+}
+
+Point projection_onto(const ExPolygons& polygons, const Point& from)
+{
+    Point  projected_pt(0, 0);
+    double min_dist = std::numeric_limits<double>::max();
+    for (const ExPolygon& poly : polygons) {
+        for (size_t i = 0; i < poly.num_contours(); ++i) {
+            const Point  p    = colorin_projection_onto_polygon(from, poly.contour_or_hole(i));
+            const double dist = (from - p).cast<double>().squaredNorm();
+            if (dist < min_dist) {
+                projected_pt = p;
+                min_dist     = dist;
+            }
+        }
+    }
+    return projected_pt;
+}
 
 bool layer_slices_contain(const ExPolygons& layer_slices, const Point& point)
 {

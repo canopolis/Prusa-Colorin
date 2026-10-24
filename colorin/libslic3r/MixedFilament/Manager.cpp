@@ -1,6 +1,9 @@
 #include "../MixedFilament.hpp"
 #include "Internal.hpp"
 
+// Prusa Colorin: PrusaSlicer 2.9.6 no define este limite (OrcaSlicer libslic3r.h, valor 255).
+namespace Slic3r { static constexpr size_t MAXIMUM_FILAMENT_NUMBER = 255; }
+
 #include <algorithm>
 #include <atomic>
 #include <boost/log/trivial.hpp>
