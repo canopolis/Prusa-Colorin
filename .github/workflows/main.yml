@@ -212,13 +212,13 @@ jobs:
       - name: Revisar nucleo (libslic3r)
         shell: pwsh
         run: |
-          cmake --build C:\ps\build --target libslic3r
+          cmake --build C:\ps\build --target libslic3r -- -k 0
           if ($LASTEXITCODE -ne 0) { Write-Error "ERROR EN EL NUCLEO: copiar las lineas con 'error' de este paso"; exit 1 }
 
       - name: Compilar programa completo
         shell: pwsh
         run: |
-          cmake --build C:\ps\build
+          cmake --build C:\ps\build -- -k 0
           if ($LASTEXITCODE -ne 0) { exit 1 }
           sccache --show-stats
 
