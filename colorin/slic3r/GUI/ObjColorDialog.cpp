@@ -481,8 +481,8 @@ ObjColorDialog::ObjColorDialog(wxWindow*                       parent,
 {
     SetDoubleBuffered(true);
 
-    std::string icon_path = (boost::format("%1%/images/Snapmaker_OrcaTitle.ico") % Slic3r::resources_dir()).str();
-    SetIcon(wxIcon(Slic3r::encode_path(icon_path.c_str()), wxBITMAP_TYPE_ICO));
+    std::string icon_path = (boost::format("%1%/icons/PrusaSlicer.ico") % Slic3r::resources_dir()).str();
+    SetIcon(wxIcon(wxString::FromUTF8(icon_path), wxBITMAP_TYPE_ICO));
 
     auto m_line_top = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
     m_line_top->SetBackgroundColour(wxColour(166, 169, 170));
@@ -732,7 +732,7 @@ ObjColorPanel::ObjColorPanel(wxWindow*                       parent,
 
         m_simple_pm_filament_count_choice = new ComboBox(phys_card_body, wxID_ANY, wxEmptyString, wxDefaultPosition,
                                                           wxSize(-1, FromDIP(30)), 0, nullptr, wxCB_READONLY);
-        m_simple_pm_filament_count_choice->SetKeepDropArrow(true);
+        /* Prusa Colorin: SetKeepDropArrow no existe en PrusaSlicer (m_simple_pm_filament_count_choice) */
         m_simple_pm_filament_count_choice->Append(_L("Automatic"));
         m_simple_pm_filament_count_choice->Append(_L("Manual selection"));
         const size_t maximum_component_count = std::min(m_colours.size(), ImageMap::continuous_color_solver_max_component_count());
@@ -770,7 +770,7 @@ ObjColorPanel::ObjColorPanel(wxWindow*                       parent,
         detail_row->Add(detail_label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
         m_simple_pm_detail_choice = new ComboBox(quality_body, wxID_ANY, wxEmptyString, wxDefaultPosition,
                                                   wxSize(-1, FromDIP(30)), 0, nullptr, wxCB_READONLY);
-        m_simple_pm_detail_choice->SetKeepDropArrow(true);
+        /* Prusa Colorin: SetKeepDropArrow no existe en PrusaSlicer (m_simple_pm_detail_choice) */
         m_simple_pm_detail_choice->Append(_L("Standard (0.16 mm)"));
         m_simple_pm_detail_choice->Append(_L("Fine (0.08 mm)"));
         m_simple_pm_detail_choice->Append(_L("Maximum (0.04 mm)"));
@@ -1224,7 +1224,7 @@ void ObjColorPanel::build_method_section(wxWindow* parent, wxBoxSizer* parent_si
     MFDTheme::apply_text(color_model_label, MFDTheme::secondary_text(), parent->GetBackgroundColour());
     m_image_map_color_mix_model_choice = new ComboBox(parent, wxID_ANY, wxEmptyString, wxDefaultPosition,
                                                        wxSize(-1, FromDIP(30)), 0, nullptr, wxCB_READONLY);
-    m_image_map_color_mix_model_choice->SetKeepDropArrow(true);
+    /* Prusa Colorin: SetKeepDropArrow no existe en PrusaSlicer (m_image_map_color_mix_model_choice) */
     m_image_map_color_mix_model_choice->Append(_L("KM/K-S physical mixing"));
     m_image_map_color_mix_model_choice->Append(_L("FilamentMixer"));
     m_image_map_color_mix_model_choice->SetSelection(
@@ -1242,7 +1242,7 @@ void ObjColorPanel::build_method_section(wxWindow* parent, wxBoxSizer* parent_si
     MFDTheme::apply_text(adaptive_mode_label, MFDTheme::secondary_text(), parent->GetBackgroundColour());
     m_adaptive_modulation_choice = new ComboBox(parent, wxID_ANY, wxEmptyString, wxDefaultPosition,
                                                  wxSize(-1, FromDIP(30)), 0, nullptr, wxCB_READONLY);
-    m_adaptive_modulation_choice->SetKeepDropArrow(true);
+    /* Prusa Colorin: SetKeepDropArrow no existe en PrusaSlicer (m_adaptive_modulation_choice) */
     m_adaptive_modulation_choice->Append(_L("Perimeter modulation"));
     m_adaptive_modulation_choice->Append(_L("Local-Z height modulation"));
     m_adaptive_modulation_choice->SetSelection(
@@ -1603,7 +1603,7 @@ ComboBox* ObjColorPanel::create_physical_filament_combo(wxWindow* parent, int ro
             m_colours[i].GetAsString(wxC2S_HTML_SYNTAX).ToStdString(),
             std::to_string(i + 1), m_combox_icon_width, m_combox_icon_height);
         combo->Append(wxString::Format("%zu", i + 1), *bmp);
-        combo->SetItemTooltip(int(i), m_colours[i].GetAsString(wxC2S_HTML_SYNTAX));
+        colorin_set_item_tooltip(combo, int(i), m_colours[i].GetAsString(wxC2S_HTML_SYNTAX));
     }
     combo->SetSelection(0);
     combo->SetName(wxString::Format("%d", row_id));

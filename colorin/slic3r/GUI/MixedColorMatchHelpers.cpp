@@ -8,7 +8,7 @@
 #include "libslic3r/ImageMap/ContinuousColorSolver.hpp"
 #include "libslic3r/ImageMap/Sampling.hpp"
 #include "GUI_App.hpp"
-#include "PresetBundle.hpp"
+#include "libslic3r/PresetBundle.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -23,7 +23,7 @@
 #include <boost/log/trivial.hpp>
 #include "nlohmann/json.hpp"
 #include "libslic3r/Utils.hpp"
-#include "libslic3r/LocalesUtils.hpp"
+#include "libslic3r/Config.hpp" // Prusa Colorin: float_to_string_decimal_point
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Print.hpp"
 

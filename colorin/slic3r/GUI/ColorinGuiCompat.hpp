@@ -24,4 +24,28 @@ namespace Slic3r { namespace GUI {
 void colorin_on_filaments_change(size_t num_filaments);
 } } // namespace Slic3r::GUI
 
+#include <array>
+#include <cmath>
+#include <string>
+
+class wxBitmap;
+
+namespace Slic3r {
+// OrcaSlicer Color.cpp: color_is_equal (misma tolerancia 0.01).
+inline bool color_is_equal(const std::array<float, 4> a, const std::array<float, 4> &b)
+{
+    for (size_t i = 0; i < 4; i++) {
+        if (std::abs(a[i] - b[i]) > 0.01)
+            return false;
+    }
+    return true;
+}
+} // namespace Slic3r
+
+// OrcaSlicer wxExtensions.cpp: icono de color con numero de filamento.
+wxBitmap *get_extruder_color_icon(std::string color, std::string label, int icon_width, int icon_height);
+
+// OrcaSlicer ComboBox::SetItemTooltip: el ComboBox de PrusaSlicer no tiene tooltip por elemento.
+template<class C, class S> inline void colorin_set_item_tooltip(C *, int, const S &) {}
+
 #endif // slic3r_ColorinGuiCompat_hpp_

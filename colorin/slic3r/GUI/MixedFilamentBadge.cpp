@@ -110,7 +110,7 @@ MixedFilamentBadge::MixedFilamentBadge(wxWindow* parent, wxWindowID id, int virt
     Bind(wxEVT_LEFT_UP, &MixedFilamentBadge::on_left_up, this);
     SetCursor(wxCursor(wxCURSOR_ARROW));
 
-    SetFont(badge_size >= 20 ? Label::Body_12 : Label::Body_8);
+    SetFont(badge_size >= 20 ? Label::Body_12 : Label::sysFont(8, false));
 
     m_solid_color = parse_mixed_color(mf.display_color);
 
@@ -240,7 +240,7 @@ wxBitmap* get_color_block_bitmap_cached(const ColorBlockParams& params)
     wxMemoryDC dc;
     dc.SelectObject(bmp);
     const bool use_small_font = std::min(params.width, params.height) < 20;
-    dc.SetFont(use_small_font ? ::Label::Body_8 : ::Label::Body_12);
+    dc.SetFont(use_small_font ? ::Label::sysFont(8, false) : ::Label::Body_12);
 
     bool very_light = false;
 
@@ -355,7 +355,7 @@ wxBitmap* get_color_block_bitmap_cached(const std::vector<wxColour>& colors, Fil
     dc.SelectObject(bmp);
     dc.SetPen(*wxTRANSPARENT_PEN);
     const bool useSmallFont = std::min(width, height) < 20;
-    dc.SetFont(useSmallFont ? ::Label::Body_8 : ::Label::Body_12);
+    dc.SetFont(useSmallFont ? ::Label::sysFont(8, false) : ::Label::Body_12);
 
     if (drawColors.size() <= 1)
     {
