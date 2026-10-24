@@ -8,7 +8,7 @@
 #include <numeric>
 #include <system_error>
 
-#include <fast_float/fast_float.h>
+#include <fast_float.h> // Prusa Colorin (FullSpectrum) PrusaSlicer bundles fast_float without the subfolder
 
 namespace Slic3r {
 
