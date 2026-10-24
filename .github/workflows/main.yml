@@ -55,6 +55,18 @@ jobs:
           # inyectaba con FORCEINCLUDE, para que cada archivo vea exactamente las mismas inclusiones.
           Add-Content -Path "C:\ps\src\libslic3r\CMakeLists.txt" -Value 'target_compile_options(libslic3r PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/FI${CMAKE_CURRENT_SOURCE_DIR}/pchheader.hpp>")'
           Add-Content -Path "C:\ps\src\slic3r\CMakeLists.txt" -Value 'target_compile_options(libslic3r_gui PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/FI${CMAKE_CURRENT_SOURCE_DIR}/pchheader.hpp>")'
+          # Prusa Colorin: OpenCV (igual que Orca FullSpectrum 0.9.18: opencv_world estatico, modulo core).
+          Add-Content -Path "C:\ps\src\libslic3r\CMakeLists.txt" -Value 'find_package(OpenCV REQUIRED core)'
+          Add-Content -Path "C:\ps\src\libslic3r\CMakeLists.txt" -Value 'target_link_libraries(libslic3r PUBLIC opencv_world)'
+          # Prusa Colorin: archivos de interfaz (ventana de color de OBJ y sus controles).
+          if (Test-Path "$env:GITHUB_WORKSPACE\colorin\slic3r") {
+            Copy-Item -Recurse -Force "$env:GITHUB_WORKSPACE\colorin\slic3r\*" "C:\ps\src\slic3r\"
+            $gui = Get-ChildItem "$env:GITHUB_WORKSPACE\colorin\slic3r" -Recurse -Include *.cpp,*.hpp,*.h |
+              ForEach-Object { $_.FullName.Substring("$env:GITHUB_WORKSPACE\colorin\slic3r\".Length).Replace('\','/') }
+            $guilines = "`ntarget_sources(libslic3r_gui PRIVATE`n" + (($gui | ForEach-Object { "  $_" }) -join "`n") + "`n)`n"
+            Add-Content -Path "C:\ps\src\slic3r\CMakeLists.txt" -Value $guilines
+            Write-Host "Archivos de interfaz agregados: $($gui.Count)"
+          }
           Write-Host "Archivos del motor agregados: $($files.Count)"
 
       - name: Aplicar cambios de Prusa Colorin a PrusaSlicer 2.9.6
@@ -80,6 +92,92 @@ jobs:
         with:
           arch: x64
 
+      - name: Cache de OpenCV
+        uses: actions/cache@v4
+        with:
+          path: C:\opencv
+          key: opencv-4.6.0-${{ steps.ver.outputs.tag }}-v1
+
+      - name: Compilar OpenCV 4.6.0 (solo si no esta guardado)
+        shell: pwsh
+        run: |
+          # Misma version, parche y opciones que Orca FullSpectrum 0.9.18 (deps/OpenCV).
+          if (Test-Path C:\opencv\OpenCVConfig.cmake) { Write-Host "OpenCV ya guardado, no se recompila."; exit 0 }
+          $prefix = Get-ChildItem C:\psdeps -Directory -Recurse -Depth 4 -Filter local | Where-Object { $_.Parent.Name -eq 'usr' } | Select-Object -First 1
+          Invoke-WebRequest https://github.com/opencv/opencv/archive/refs/tags/4.6.0.tar.gz -OutFile C:\ocv.tar.gz
+          $h = (Get-FileHash C:\ocv.tar.gz -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne '1ec1cba65f9f20fe5a41fda1586e01c70ea0c9a6d7b67c9e13edf0cfe2239277') { Write-Error "Hash de OpenCV no coincide"; exit 1 }
+          tar -xzf C:\ocv.tar.gz -C C:\
+          Invoke-WebRequest https://raw.githubusercontent.com/canopolis/OrcaSlicer-FullSpectrum-Plus/v0.9.18/deps/OpenCV/0001-vs2022.patch -OutFile C:\ocv-vs2022.patch
+          Set-Location C:\opencv-4.6.0
+          git apply --verbose --ignore-space-change --whitespace=fix C:\ocv-vs2022.patch
+          if ($LASTEXITCODE -ne 0) { Write-Error "No se pudo aplicar el parche de OpenCV"; exit 1 }
+          cmake -S C:\opencv-4.6.0 -B C:\ocvbuild -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=C:\opencv `
+            "-DCMAKE_PREFIX_PATH=$($prefix.FullName)" `
+            "-DBUILD_SHARED_LIBS=0" `
+            "-DBUILD_PERE_TESTS=OFF" `
+            "-DBUILD_TESTS=OFF" `
+            "-DBUILD_opencv_python_tests=OFF" `
+            "-DBUILD_EXAMPLES=OFF" `
+            "-DBUILD_JASPER=OFF" `
+            "-DBUILD_JAVA=OFF" `
+            "-DBUILD_JPEG=ON" `
+            "-DBUILD_APPS_LIST=version" `
+            "-DBUILD_opencv_apps=OFF" `
+            "-DBUILD_opencv_java=OFF" `
+            "-DBUILD_OPENEXR=OFF" `
+            "-DBUILD_PNG=ON" `
+            "-DBUILD_TBB=OFF" `
+            "-DBUILD_WEBP=OFF" `
+            "-DBUILD_ZLIB=OFF" `
+            "-DWITH_1394=OFF" `
+            "-DWITH_CUDA=OFF" `
+            "-DWITH_EIGEN=OFF" `
+            "-DWITH_IPP=ON" `
+            "-DWITH_ITT=OFF" `
+            "-DWITH_FFMPEG=OFF" `
+            "-DWITH_GPHOTO2=OFF" `
+            "-DWITH_GSTREAMER=OFF" `
+            "-DOPENCV_GAPI_GSTREAMER=OFF" `
+            "-DWITH_GTK_2_X=OFF" `
+            "-DWITH_JASPER=OFF" `
+            "-DWITH_LAPACK=OFF" `
+            "-DWITH_MATLAB=OFF" `
+            "-DWITH_MFX=OFF" `
+            "-DWITH_DIRECTX=OFF" `
+            "-DWITH_DIRECTML=OFF" `
+            "-DWITH_OPENCL=OFF" `
+            "-DWITH_OPENCL_D3D11_NV=OFF" `
+            "-DWITH_OPENCLAMDBLAS=OFF" `
+            "-DWITH_OPENCLAMDFFT=OFF" `
+            "-DWITH_OPENEXR=OFF" `
+            "-DWITH_OPENJPEG=OFF" `
+            "-DWITH_QUIRC=OFF" `
+            "-DWITH_VTK=OFF" `
+            "-DWITH_WEBP=OFF" `
+            "-DENABLE_PRECOMPILED_HEADERS=OFF" `
+            "-DINSTALL_TESTS=OFF" `
+            "-DINSTALL_C_EXAMPLES=OFF" `
+            "-DINSTALL_PYTHON_EXAMPLES=OFF" `
+            "-DOPENCV_GENERATE_SETUPVARS=OFF" `
+            "-DOPENCV_INSTALL_FFMPEG_DOWNLOAD_SCRIPT=OFF" `
+            "-DBUILD_opencv_python2=OFF" `
+            "-DBUILD_opencv_python3=OFF" `
+            "-DWITH_OPENVINO=OFF" `
+            "-DWITH_INF_ENGINE=OFF" `
+            "-DWITH_NGRAPH=OFF" `
+            "-DBUILD_WITH_STATIC_CRT=OFF" `
+            "-DBUILD_LIST=core,imgcodecs,imgproc,world" `
+            "-DBUILD_opencv_highgui=OFF" `
+            "-DWITH_ADE=OFF" `
+            "-DBUILD_opencv_world=ON" `
+            "-DWITH_PROTOBUF=OFF" `
+            "-DWITH_WIN32UI=OFF" `
+            "-DHAVE_WIN32UI=FALSE"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cmake --build C:\ocvbuild --target install
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       - name: Preparar cache de compilacion (sccache)
         uses: mozilla-actions/sccache-action@v0.0.4
 
@@ -102,6 +200,7 @@ jobs:
           # Ninja + sccache: solo se recompila lo que cambio. Sin cabeceras precompiladas (sccache no las admite en MSVC).
           cmake -S C:\ps -B C:\ps\build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSLIC3R_PCH=OFF `
                 "-DCMAKE_PREFIX_PATH=$($prefix.FullName)" `
+                "-DOpenCV_DIR=C:\opencv" `
                 -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
