@@ -2165,4 +2165,14 @@ void copy_bed_model_and_texture_if_needed(DynamicPrintConfig& config)
     do_copy(config.option<ConfigOptionString>("bed_custom_model"), "model");
 }
 
+// Prusa Colorin (FullSpectrum): copia de Orca FullSpectrum 0.9.18.
+void PresetBundle::sync_mixed_filament_definitions_to_project_config()
+{
+    const std::string serialized = this->mixed_filaments.serialize_custom_entries();
+    if (ConfigOptionString *opt = this->project_config.option<ConfigOptionString>("mixed_filament_definitions"))
+        opt->value = serialized;
+    else
+        this->project_config.set_key_value("mixed_filament_definitions", new ConfigOptionString(serialized));
+}
+
 } // namespace Slic3r
