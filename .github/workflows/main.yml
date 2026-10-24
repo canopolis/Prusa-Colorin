@@ -56,6 +56,7 @@ jobs:
           Add-Content -Path "C:\ps\src\libslic3r\CMakeLists.txt" -Value 'target_compile_options(libslic3r PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/FI${CMAKE_CURRENT_SOURCE_DIR}/pchheader.hpp>")'
           Add-Content -Path "C:\ps\src\slic3r\CMakeLists.txt" -Value 'target_compile_options(libslic3r_gui PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/FI${CMAKE_CURRENT_SOURCE_DIR}/pchheader.hpp>")'
           # Prusa Colorin: OpenCV (igual que Orca FullSpectrum 0.9.18: opencv_world estatico, modulo core).
+          Add-Content -Path "C:\ps\src\libslic3r\CMakeLists.txt" -Value 'set(OpenCV_STATIC ON)'
           Add-Content -Path "C:\ps\src\libslic3r\CMakeLists.txt" -Value 'find_package(OpenCV REQUIRED core)'
           Add-Content -Path "C:\ps\src\libslic3r\CMakeLists.txt" -Value 'target_link_libraries(libslic3r PUBLIC opencv_world)'
           # Prusa Colorin: archivos de interfaz (ventana de color de OBJ y sus controles).
@@ -198,9 +199,13 @@ jobs:
           if (-not $prefix) { Write-Error "No se encontro la carpeta usr\local de las librerias"; exit 1 }
           Write-Host "Librerias: $($prefix.FullName)"
           # Ninja + sccache: solo se recompila lo que cambio. Sin cabeceras precompiladas (sccache no las admite en MSVC).
+          # OpenCV estatico: se usa directamente la carpeta staticlib (igual que el enlace de Orca).
+          $ocv = Get-ChildItem C:\opencv -Recurse -Filter OpenCVConfig.cmake | Where-Object { $_.DirectoryName -match 'staticlib' } | Select-Object -First 1
+          if (-not $ocv) { Write-Error "No se encontro OpenCV estatico en C:\opencv"; exit 1 }
+          Write-Host "OpenCV: $($ocv.DirectoryName)"
           cmake -S C:\ps -B C:\ps\build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSLIC3R_PCH=OFF `
                 "-DCMAKE_PREFIX_PATH=$($prefix.FullName)" `
-                "-DOpenCV_DIR=C:\opencv" `
+                "-DOpenCV_DIR=$($ocv.DirectoryName)" `
                 -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
