@@ -44,7 +44,7 @@ void Accordion::build_ui(const wxString& title)
     m_title_text->SetMinSize(wxSize(1, -1));
 
     // Load both chevron states upfront so we only allocate bitmaps once.
-    wxBitmap normal_bmp = ScalableBitmap(m_header_panel, "drop_down", 20).bmp();
+    wxBitmap normal_bmp = ScalableBitmap(m_header_panel, "drop_down", 20).bmp().GetBitmapFor(m_header_panel); // Prusa Colorin: bmp() es wxBitmapBundle
     m_chevron_normal  = normal_bmp;
     m_chevron_rotated = wxBitmap(normal_bmp.ConvertToImage().Rotate180());
 

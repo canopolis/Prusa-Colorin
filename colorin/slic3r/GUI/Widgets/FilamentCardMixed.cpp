@@ -5,6 +5,7 @@
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/GUI_Factories.hpp"
 #include "slic3r/GUI/MainFrame.hpp"
+#include "slic3r/GUI/Widgets/Label.hpp" // Prusa Colorin
 #include "slic3r/GUI/MixedFilamentBadge.hpp"
 #include "slic3r/GUI/MixedColorMatchHelpers.hpp"
 #include "libslic3r/MixedFilament.hpp"
@@ -400,7 +401,7 @@ void FilamentCardMixed::build_ui()
 void FilamentCardMixed::msw_rescale()
 {
     if (m_action_btn != nullptr)
-        m_action_btn->msw_rescale();
+        m_action_btn->sys_color_changed();
 
     if (m_clr_swatch_panel != nullptr)
         m_clr_swatch_panel->Refresh();
