@@ -236,7 +236,13 @@ jobs:
           Write-Host "Ejecutable: $($exe.FullName)"
           # Solo los archivos de la carpeta del ejecutable (exe y dll), sin las carpetas intermedias de compilacion.
           $files = Get-ChildItem -Path $exe.DirectoryName -File | Where-Object { $_.Extension -in '.exe', '.dll' }
-          Compress-Archive -Path $files.FullName -DestinationPath "PrusaColorin-portable.zip"
+          # Prusa Colorin: el programa necesita la carpeta resources (iconos, perfiles, shaders) junto al .exe.
+          $pkg = "C:\pkg\PrusaColorin"
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item -Path $files.FullName -Destination $pkg -Force
+          Copy-Item -Recurse -Force "C:\ps\resources" "$pkg\resources"
+          Write-Host "Archivos en el portable: $((Get-ChildItem $pkg -Recurse -File).Count)"
+          Compress-Archive -Path "$pkg\*" -DestinationPath "PrusaColorin-portable.zip"
 
       - name: Subir resultado
         uses: actions/upload-artifact@v4
