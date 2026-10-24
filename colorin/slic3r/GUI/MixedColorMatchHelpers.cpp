@@ -1713,8 +1713,8 @@ static std::vector<double> selected_filament_transmission_distances(PresetBundle
         Preset::remove_suffix_modified(edited_filament_preset->name) :
         std::string();
 
-    for (size_t i = 0; i < count && i < preset_bundle->filament_presets.size(); ++i) {
-        const std::string selected_filament_name = Preset::remove_suffix_modified(preset_bundle->filament_presets[i]);
+    for (size_t i = 0; i < count && i < colorin_filament_presets(*preset_bundle).size(); ++i) {
+        const std::string selected_filament_name = Preset::remove_suffix_modified(colorin_filament_presets(*preset_bundle)[i]);
         const Preset *filament_preset =
             (!edited_filament_name.empty() && selected_filament_name == edited_filament_name) ?
             edited_filament_preset :
@@ -1756,8 +1756,8 @@ static std::vector<std::string> selected_filament_full_spectrum_material_ids(Pre
         Preset::remove_suffix_modified(edited_filament_preset->name) :
         std::string();
 
-    for (size_t index = 0; index < count && index < preset_bundle->filament_presets.size(); ++index) {
-        const std::string selected_filament_name = Preset::remove_suffix_modified(preset_bundle->filament_presets[index]);
+    for (size_t index = 0; index < count && index < colorin_filament_presets(*preset_bundle).size(); ++index) {
+        const std::string selected_filament_name = Preset::remove_suffix_modified(colorin_filament_presets(*preset_bundle)[index]);
         const Preset* filament_preset =
             (!edited_filament_name.empty() && selected_filament_name == edited_filament_name) ?
             edited_filament_preset :
@@ -1798,8 +1798,8 @@ static std::vector<std::string> selected_filament_material_types(PresetBundle* p
         Preset::remove_suffix_modified(edited_filament_preset->name) :
         std::string();
 
-    for (size_t index = 0; index < count && index < preset_bundle->filament_presets.size(); ++index) {
-        const std::string selected_filament_name = Preset::remove_suffix_modified(preset_bundle->filament_presets[index]);
+    for (size_t index = 0; index < count && index < colorin_filament_presets(*preset_bundle).size(); ++index) {
+        const std::string selected_filament_name = Preset::remove_suffix_modified(colorin_filament_presets(*preset_bundle)[index]);
         const Preset* filament_preset =
             (!edited_filament_name.empty() && selected_filament_name == edited_filament_name) ?
             edited_filament_preset :
@@ -1807,7 +1807,7 @@ static std::vector<std::string> selected_filament_material_types(PresetBundle* p
 
         if (filament_preset != nullptr) {
             std::string dummy;
-            std::string type = const_cast<Preset*>(filament_preset)->get_filament_type(dummy);
+            std::string type = colorin_filament_type(*filament_preset);
             if (!type.empty())
                 material_types[index] = type;
             else if (filament_preset->config.has("filament_type"))
@@ -2528,11 +2528,11 @@ static void load_filament_compatibility()
 
     try {
         // Prefer user data dir (where PresetUpdater deploys updates), fall back to bundled resources
-        const boost::filesystem::path user_path = (boost::filesystem::path(Slic3r::data_dir()) / PRESET_SYSTEM_DIR
-                                                    / PresetBundle::SM_BUNDLE / "filament"
+        const boost::filesystem::path user_path = (boost::filesystem::path(Slic3r::data_dir()) / "system"
+                                                    / "Snapmaker" / "filament"
                                                     / "filament_compatibility.json").make_preferred();
         const boost::filesystem::path rsrc_path = (boost::filesystem::path(Slic3r::resources_dir()) / "profiles"
-                                                    / PresetBundle::SM_BUNDLE / "filament"
+                                                    / "Snapmaker" / "filament"
                                                     / "filament_compatibility.json").make_preferred();
         const std::string path = (boost::filesystem::exists(user_path) ? user_path : rsrc_path).string();
 
@@ -2601,7 +2601,7 @@ static std::vector<ResolvedFilamentCategory> resolve_filament_categories(
     std::vector<ResolvedFilamentCategory> result;
     if (!preset_bundle) return result;
 
-    const auto& filament_presets = preset_bundle->filament_presets;
+    const auto& filament_presets = colorin_filament_presets(*preset_bundle);
     result.reserve(filament_ids.size());
 
     for (unsigned int id : filament_ids) {
@@ -2728,7 +2728,7 @@ bool is_filament_compatible(const MixedFilament& mf)
         }
 
         PresetBundle* preset_bundle = wxGetApp().preset_bundle;
-        if (!preset_bundle || preset_bundle->filament_presets.empty()) {
+        if (!preset_bundle || colorin_filament_presets(*preset_bundle).empty()) {
             BOOST_LOG_TRIVIAL(error)
                 << "Mixed filament compatibility: PresetBundle is "
                 << (preset_bundle ? "empty (no filament presets)" : "null")
@@ -2736,7 +2736,7 @@ bool is_filament_compatible(const MixedFilament& mf)
             return false;
         }
 
-        const size_t num_physical = preset_bundle->filament_presets.size();
+        const size_t num_physical = colorin_filament_presets(*preset_bundle).size();
         const auto groups = MixedFilamentManager::split_pattern_groups(norm);
         for (const auto& group : groups) {
             const auto tokens = MixedFilamentManager::split_pattern_group_to_tokens(group, num_physical);
@@ -2938,7 +2938,7 @@ std::vector<ModelColorEntry> extract_model_colors(const Print& print)
         for (const ModelVolume* vol : model_obj->volumes) {
             if (!vol || vol->type() != ModelVolumeType::MODEL_PART) continue;
 
-            for (int eid : vol->get_extruders()) {
+            for (int eid : colorin_volume_extruders(*vol)) {
                 if (eid < 1 || eid > MAX_EXTRUDER_ID) continue;
                 size_t idx = size_t(eid - 1);
 
@@ -3355,7 +3355,7 @@ std::vector<std::string> recommend_best_filament_combo(
                     // worker, whose palette is a single Full Spectrum PLA preset (same material by
                     // construction) — no cross-type pair can exist, so the filter is a no-op. It
                     // also keeps the worker off preset_bundle: build_compatibility_matrix reads
-                    // preset_bundle->filament_presets unsynchronized, which would race the UI thread
+                    // colorin_filament_presets(*preset_bundle) unsynchronized, which would race the UI thread
                     // (data-race UB) from this worker call site. The slice gate still enforces real
                     // incompatibility at slice time.
                     double sum_de = 0.0;
@@ -3476,7 +3476,7 @@ void apply_batch_match_to_model(const BatchMatchResult& result)
 
             // Level 1: triangle-level MMU data (MODEL_PART only — modifiers
             // carry no paint data).
-            if (is_part && !mv->mmu_segmentation_facets.empty())
+            if (is_part && !mv->mm_segmentation_facets.empty())
                 colorin_remap_extruder_ids(*mv, total_filaments, state_map);
 
             // Level 2: config-level extruder for parts and modifiers.

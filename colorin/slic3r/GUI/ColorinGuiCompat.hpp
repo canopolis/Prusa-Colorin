@@ -60,4 +60,19 @@ using EnforcerBlockerStateMap = std::array<TriangleStateType, 256>;
 void colorin_remap_extruder_ids(ModelVolume &mv, size_t extruder_count, const EnforcerBlockerStateMap &state_map);
 } // namespace Slic3r
 
+#include <vector>
+
+namespace Slic3r {
+class PresetBundle;
+class Preset;
+// OrcaSlicer libslic3r.h: MAXIMUM_EXTRUDER_NUMBER = 64.
+inline constexpr size_t MAXIMUM_EXTRUDER_NUMBER = 64;
+// OrcaSlicer PresetBundle::filament_presets: nombre del filamento elegido en cada posicion.
+std::vector<std::string> colorin_filament_presets(const PresetBundle &preset_bundle);
+// OrcaSlicer Preset::get_filament_type (PrusaSlicer no tiene filament_is_support: devuelve filament_type).
+std::string colorin_filament_type(const Preset &preset);
+// OrcaSlicer ModelVolume::get_extruders.
+std::vector<int> colorin_volume_extruders(const ModelVolume &mv);
+} // namespace Slic3r
+
 #endif // slic3r_ColorinGuiCompat_hpp_
