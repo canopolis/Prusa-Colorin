@@ -18,4 +18,10 @@ inline ColorRGB colorin_orca_rgb() { return ColorRGB(0.0f, 150.f / 255.0f, 136.0
 // Prusa Colorin usa modo claro.
 inline wxColour colorin_dark_mode_color_for(const wxColour &color) { return color; }
 
+namespace Slic3r { namespace GUI {
+// OrcaSlicer Plater::on_filaments_change(): guarda los filamentos mezclados en el proyecto
+// y avisa a PrusaSlicer del cambio de configuracion.
+void colorin_on_filaments_change(size_t num_filaments);
+} } // namespace Slic3r::GUI
+
 #endif // slic3r_ColorinGuiCompat_hpp_
