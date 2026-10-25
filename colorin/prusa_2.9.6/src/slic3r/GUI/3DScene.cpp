@@ -1696,6 +1696,185 @@ std::shared_ptr<SourceColorPreviewJob> start_source_color_preview(std::shared_pt
 
 } // namespace
 
+// Prusa Colorin (Orca FullSpectrum 0.9.18): mixed-filament gradient and image-map palette helpers (V2b).
+// Prusa Colorin (Orca 0.9.18 / BBS): colour adjustment used by the image-map and mixed-filament preview.
+static ColorRGBA adjust_color_for_rendering(const ColorRGBA& colors)
+{
+    constexpr float fully_transparent_threshold = 0.1f;
+    constexpr float fully_transparent_alpha     = 0.3f;
+    constexpr float full_black_threshold        = 0.2f;
+    if (colors.a() < fully_transparent_threshold)
+        return {1.f, 1.f, 1.f, fully_transparent_alpha};
+    if (colors.r() < full_black_threshold && colors.g() < full_black_threshold && colors.b() < full_black_threshold)
+        return {full_black_threshold, full_black_threshold, full_black_threshold, colors.a()};
+    return colors;
+}
+
+static std::vector<ColorRGBA> mixed_filament_preview_gradient_colors(
+    const MixedFilamentDefinition&     definition,
+    const MixedFilamentDisplayContext& display_context)
+{
+    const std::vector<wxColour> preview_colors =
+        GUI::build_mixed_filament_gradient_preview(definition, display_context).sampled_colors;
+    std::vector<ColorRGBA> colors;
+    colors.reserve(preview_colors.size());
+    for (const wxColour& color : preview_colors) {
+        colors.emplace_back(float(color.Red()) / 255.f,
+                            float(color.Green()) / 255.f,
+                            float(color.Blue()) / 255.f,
+                            1.f);
+    }
+    return colors;
+}
+
+static ColorRGBA interpolate_preview_gradient_color(const ColorRGBA& a, const ColorRGBA& b, double local)
+{
+    ColorRGBA out;
+    local = std::clamp(local, 0.0, 1.0);
+    for (size_t channel = 0; channel < 4; ++channel)
+        out[channel] = float(double(a[channel]) * (1.0 - local) + double(b[channel]) * local);
+    return out;
+}
+
+static ColorRGBA sample_preview_gradient_color(const std::vector<ColorRGBA>& colors,
+                                               const std::vector<double>&    positions,
+                                               double                        t)
+{
+    if (colors.empty())
+        return ColorRGBA::WHITE();
+    if (colors.size() == 1)
+        return colors.front();
+
+    const size_t expected_stops = 2 * colors.size() - 1;
+    if (positions.size() == expected_stops) {
+        const double progress = std::clamp(t, 0.0, std::nextafter(1.0, 0.0));
+        for (size_t idx = 0; idx + 1 < colors.size(); ++idx) {
+            const double p_start = std::clamp(positions[2 * idx], 0.0, 1.0);
+            const double p_mid   = std::clamp(positions[2 * idx + 1], p_start, 1.0);
+            const double p_end   = std::clamp(positions[2 * idx + 2], p_mid, 1.0);
+            if (progress > p_end && idx + 2 < colors.size())
+                continue;
+
+            double local = 0.0;
+            if (p_end <= p_start + EPSILON)
+                local = 0.0;
+            else if (progress <= p_mid)
+                local = 0.5 * std::clamp((progress - p_start) / std::max(EPSILON, p_mid - p_start), 0.0, 1.0);
+            else
+                local = 0.5 + 0.5 * std::clamp((progress - p_mid) / std::max(EPSILON, p_end - p_mid), 0.0, 1.0);
+            return interpolate_preview_gradient_color(colors[idx], colors[idx + 1], local);
+        }
+        return colors.back();
+    }
+
+    const double scaled = std::clamp(t, 0.0, std::nextafter(1.0, 0.0)) * double(colors.size() - 1);
+    const size_t idx    = std::min<size_t>(colors.size() - 2, size_t(std::floor(scaled)));
+    const double local  = scaled - double(idx);
+    return interpolate_preview_gradient_color(colors[idx], colors[idx + 1], local);
+}
+
+static bool render_preview_gradient_model(GUI::GLModel&                         model,
+                                          const std::pair<size_t, size_t>&       tverts_range,
+                                          GLShaderProgram*                      shader,
+                                          const BoundingBoxf3&                  box,
+                                          const std::array<float, 2>&           z_range,
+                                          const std::vector<ColorRGBA>&         colors,
+                                          const std::vector<double>&            positions,
+                                          float                                 alpha)
+{
+    if (shader == nullptr || !model.is_initialized() || colors.size() < 2)
+        return false;
+
+    const double z_min = box.min.z();
+    const double z_max = box.max.z();
+    const double z_height = z_max - z_min;
+    const double clip_min = std::max<double>(z_min, z_range[0]);
+    const double clip_max = std::min<double>(z_max, z_range[1]);
+    if (z_height <= EPSILON || clip_max <= clip_min + EPSILON)
+        return false;
+
+    bool rendered = false;
+    const size_t band_count = std::clamp<size_t>(colors.size() * 16, 24, 64);
+    for (size_t band_idx = 0; band_idx < band_count; ++band_idx) {
+        const double band_min = z_min + z_height * double(band_idx) / double(band_count);
+        const double band_max = z_min + z_height * double(band_idx + 1) / double(band_count);
+        const double draw_min = std::max<double>(band_min, clip_min);
+        const double draw_max = std::min<double>(band_max, clip_max);
+        if (draw_max <= draw_min + EPSILON)
+            continue;
+
+        ColorRGBA band_color = adjust_color_for_rendering(sample_preview_gradient_color(colors, positions,
+                                                                                       (double(band_idx) + 0.5) / double(band_count)));
+        band_color.a(alpha);
+        model.set_color(band_color);
+        shader->set_uniform("z_range", std::array<float, 2>{float(draw_min), float(draw_max)});
+        if (tverts_range == std::make_pair<size_t, size_t>(0, -1))
+            model.render();
+        else
+            model.render(tverts_range);
+        rendered = true;
+    }
+    return rendered;
+}
+
+static bool volume_has_surface_segmentation(const GLVolume& volume)
+{
+    ModelObjectPtrs& model_objects = GUI::wxGetApp().model().objects;
+    if (volume.object_idx() < 0 || volume.object_idx() >= model_objects.size())
+        return false;
+
+    const ModelObject* model_object = model_objects[volume.object_idx()];
+    if (model_object == nullptr || volume.volume_idx() < 0 || volume.volume_idx() >= model_object->volumes.size())
+        return false;
+
+    const ModelVolume* model_volume = model_object->volumes[volume.volume_idx()];
+    return model_volume != nullptr && model_volume->is_mm_painted();
+}
+
+struct ImageMapPreviewPalette
+{
+    const MixedFilamentManager* manager{nullptr};
+    size_t                      num_physical{0};
+    size_t                      num_total{0};
+
+    unsigned int resolve(const ImageMap::PaletteEntry& entry) const
+    {
+        if (manager != nullptr && entry.mixed_filament_stable_id != 0) {
+            const std::optional<unsigned int> stable = manager->filament_id_from_stable_id(entry.mixed_filament_stable_id, num_physical);
+            if (stable && *stable >= 1 && *stable <= num_total)
+                return *stable;
+        }
+        return entry.fallback_filament_id >= 1 && entry.fallback_filament_id <= num_total ? entry.fallback_filament_id : 0u;
+    }
+
+    size_t signature(const ImageMap::VolumeData& data, unsigned int base_filament_id) const
+    {
+        size_t seed = base_filament_id;
+        auto hash_combine = [&seed](size_t value) {
+            seed ^= value + size_t(0x9e3779b9) + (seed << 6) + (seed >> 2);
+        };
+        hash_combine(num_physical);
+        hash_combine(num_total);
+        for (const ImageMap::Zone& zone : data.zones) {
+            hash_combine(zone.enabled ? 1u : 0u);
+            for (const ImageMap::PaletteEntry& entry : zone.palette)
+                hash_combine(resolve(entry));
+        }
+        return seed;
+    }
+};
+
+static ImageMapPreviewPalette image_map_preview_palette()
+{
+    ImageMapPreviewPalette palette;
+    if (GUI::wxGetApp().preset_bundle == nullptr)
+        return palette;
+    palette.manager      = &GUI::wxGetApp().preset_bundle->mixed_filaments;
+    palette.num_physical = size_t(std::max(GUI::wxGetApp().extruders_edited_cnt(), 0));
+    palette.num_total    = palette.manager->total_filaments(palette.num_physical);
+    return palette;
+}
+
 GLVolume::GLVolume(float r, float g, float b, float a)
     : m_sla_shift_z(0.0)
     , m_sinking_contours(*this)
