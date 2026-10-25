@@ -236,6 +236,9 @@ public:
 
     // Progress in [0, 1] while the source-colour display mesh is prepared on a worker thread.
     std::optional<float> source_color_preview_progress() const;
+    // Prusa Colorin (Orca 0.9.18, V2c): draws the image-map source-colour preview; false = use the normal render.
+    bool render_image_map_source_preview(const Transform3d& view_matrix, const Transform3d& projection_matrix,
+                                         const std::array<float, 2>& z_range);
     // Ranges of triangle and quad indices to be rendered.
     std::pair<size_t, size_t>   tverts_range;
 

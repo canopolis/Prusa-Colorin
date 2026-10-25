@@ -2082,6 +2082,427 @@ void GLVolume::render()
         glsafe(::glFrontFace(GL_CCW));
 }
 
+// Prusa Colorin: PrusaSlicer GLTexture has no load_from_raw_data (Orca has). Minimal port for the
+// image-map texture preview (no mipmaps, no anisotropy, as used there).
+class ColorinRawTexture : public GUI::GLTexture
+{
+public:
+    bool load_from_raw_data(std::vector<unsigned char> data, unsigned int w, unsigned int h, bool /*apply_anisotropy*/, bool /*use_mipmaps*/)
+    {
+        m_width  = int(w);
+        m_height = int(h);
+        if (m_width <= 0 || m_height <= 0 || data.size() < size_t(m_width) * size_t(m_height) * 4) {
+            reset();
+            return false;
+        }
+        glsafe(::glPixelStorei(GL_UNPACK_ALIGNMENT, 1));
+        glsafe(::glGenTextures(1, &m_id));
+        glsafe(::glBindTexture(GL_TEXTURE_2D, m_id));
+        glsafe(::glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)m_width, (GLsizei)m_height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                              (const void*)data.data()));
+        glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
+        glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0));
+        glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
+        glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
+        m_source = "colorin_raw_data";
+        return true;
+    }
+};
+
+// Prusa Colorin (Orca FullSpectrum 0.9.18, V2c): image-map source-colour preview in the 3D view.
+// Ported from Orca GLVolume::simple_render. Returns true when the volume was drawn here; otherwise
+// the caller falls back to the normal PrusaSlicer rendering. The current shader (gouraud) must be
+// active with its matrices already set.
+bool GLVolume::render_image_map_source_preview(const Transform3d& view_matrix, const Transform3d& projection_matrix,
+                                               const std::array<float, 2>& z_range)
+{
+    if (!is_active)
+        return false;
+    GLShaderProgram* shader = GUI::wxGetApp().get_current_shader();
+    if (shader == nullptr || GUI::wxGetApp().plater() == nullptr)
+        return false;
+
+    ModelObjectPtrs&       model_objects   = GUI::wxGetApp().model().objects;
+    std::vector<ColorRGBA> extruder_colors = GUI::wxGetApp().plater()->get_extruder_colors_from_plater_config();
+
+    bool         color_volume                 = false;
+    bool         source_color_volume          = false;
+    bool         palette_source_color_volume  = false;
+    bool         adaptive_source_color_volume = false;
+    ModelObject* model_object                 = nullptr;
+    ModelVolume* model_volume                 = nullptr;
+    do {
+        if ((!printable) || object_idx() >= model_objects.size())
+            break;
+        model_object = model_objects[object_idx()];
+
+        if (volume_idx() >= model_object->volumes.size())
+            break;
+        model_volume                                                     = model_object->volumes[volume_idx()];
+        const bool interactive_image_map_preview = image_map_preview_override_data != nullptr;
+        const std::shared_ptr<const ImageMap::VolumeData> image_map_data = image_map_preview_override_data ?
+                                                                               image_map_preview_override_data :
+                                                                               model_volume->image_map_data();
+        if (model_volume->mmu_segmentation_facets.empty() && (!image_map_data || image_map_data->empty()))
+            break;
+
+        std::optional<ImageMap::RenderMode> image_map_render_mode;
+        if (image_map_data) {
+            const auto zone_it = std::find_if(image_map_data->zones.begin(), image_map_data->zones.end(),
+                                              [](const ImageMap::Zone& zone) { return zone.enabled; });
+            if (zone_it != image_map_data->zones.end())
+                image_map_render_mode = zone_it->render_mode;
+        }
+        const bool quantized_image_map = image_map_render_mode == ImageMap::RenderMode::NormalMix;
+        // A settings override is specifically a printable-result prediction:
+        // otherwise the global "Original texture" preference bypasses the
+        // modulation filters and makes live quality controls appear inert.
+        const bool predicted_image_map = interactive_image_map_preview || GUI::image_map_preview_predicted_colors();
+        // Filament-ID thumbnails require exact per-filament geometry. Normal
+        // interactive rendering uses the bounded asynchronous preview below.
+        if (image_map_render_mode) {
+            {
+                std::vector<ImageMap::ContinuousColorComponent> preview_components = !predicted_image_map || quantized_image_map ?
+                                                                                         std::vector<ImageMap::ContinuousColorComponent>() :
+                                                                                         source_color_preview_components();
+                const ImageMapPreviewPalette                    preview_palette    = image_map_preview_palette();
+                const unsigned int                              base_filament_id   = unsigned(
+                    std::clamp(model_volume->extruder_id(), 1, int(std::max<size_t>(1, preview_palette.num_total))));
+                std::vector<SourceColorPreviewAssignment> assignments;
+                if (predicted_image_map &&
+                    (quantized_image_map || *image_map_render_mode == ImageMap::RenderMode::AdaptiveLocalizedCycles)) {
+                    std::optional<MixedFilamentDisplayContext> adaptive_display_context;
+                    if (*image_map_render_mode == ImageMap::RenderMode::AdaptiveLocalizedCycles) {
+                        std::vector<std::string> physical_colors;
+                        physical_colors.reserve(preview_components.size());
+                        for (const ImageMap::ContinuousColorComponent& component : preview_components)
+                            physical_colors.emplace_back(component.color_hex);
+                        adaptive_display_context = GUI::build_mixed_filament_display_context(physical_colors);
+                    }
+                    for (const ImageMap::Zone& zone : image_map_data->zones) {
+                        if (!zone.enabled || zone.render_mode != *image_map_render_mode)
+                            continue;
+                        const uint32_t zone_index = uint32_t(&zone - image_map_data->zones.data());
+                        for (const ImageMap::PaletteEntry& entry : zone.palette) {
+                            const unsigned int filament_id = preview_palette.resolve(entry);
+                            if (filament_id == 0)
+                                continue;
+                            RGBA display_color = *image_map_render_mode == ImageMap::RenderMode::AdaptiveLocalizedCycles ?
+                                                     RGBA{0.55f, 0.55f, 0.55f, 1.f} :
+                                                     entry.target_color;
+                            if (quantized_image_map && filament_id <= extruder_colors.size()) {
+                                const ColorRGBA adjusted = adjust_color_for_rendering(extruder_colors[filament_id - 1]);
+                                display_color            = {adjusted.r(), adjusted.g(), adjusted.b(), adjusted.a()};
+                            }
+                            std::vector<ImageMap::ContinuousColorComponent> assignment_components;
+                            if (*image_map_render_mode == ImageMap::RenderMode::AdaptiveLocalizedCycles) {
+                                if (filament_id >= 1 && filament_id <= preview_components.size())
+                                    display_color = source_color_preview_rgba(preview_components[filament_id - 1].color_hex);
+                            }
+                            if (*image_map_render_mode == ImageMap::RenderMode::AdaptiveLocalizedCycles &&
+                                preview_palette.manager != nullptr && adaptive_display_context) {
+                                const std::optional<MixedFilamentDefinition> definition =
+                                    preview_palette.manager->mixed_filament_definition_from_id(filament_id, preview_palette.num_physical);
+                                if (definition) {
+                                    display_color = source_color_preview_rgba(
+                                        compute_mixed_filament_display_color(*definition, *adaptive_display_context));
+                                    for (const MixedFilamentWeightedComponent& component : definition->recipe.blend.components) {
+                                        const unsigned int component_id = component.filament.id;
+                                        const bool already_added = std::any_of(assignment_components.begin(), assignment_components.end(),
+                                                                               [component_id, &preview_components](
+                                                                                   const ImageMap::ContinuousColorComponent& existing) {
+                                                                                   return component_id >= 1 &&
+                                                                                          component_id <= preview_components.size() &&
+                                                                                          existing.color_hex ==
+                                                                                              preview_components[component_id - 1].color_hex;
+                                                                               });
+                                        if (component.percent > 0 && component_id >= 1 && component_id <= preview_components.size() &&
+                                            !already_added)
+                                            assignment_components.push_back(preview_components[component_id - 1]);
+                                    }
+                                }
+                            }
+                            assignments.push_back(
+                                {zone_index, entry.target_color, filament_id, display_color, std::move(assignment_components)});
+                        }
+                    }
+                }
+                size_t preview_signature = source_color_preview_signature(preview_components);
+                preview_signature ^= size_t(*image_map_render_mode) + size_t(0x9e3779b9) + (preview_signature << 6) +
+                                     (preview_signature >> 2);
+                const size_t assignment_signature = source_color_preview_assignment_signature(assignments);
+                preview_signature ^= assignment_signature + size_t(0x9e3779b9) + (preview_signature << 6) + (preview_signature >> 2);
+                const size_t palette_signature = preview_palette.signature(*image_map_data, base_filament_id);
+                preview_signature ^= palette_signature + size_t(0x9e3779b9) + (preview_signature << 6) + (preview_signature >> 2);
+                const size_t zone_signature = source_color_preview_zone_signature(*image_map_data);
+                preview_signature ^= zone_signature + size_t(0x9e3779b9) + (preview_signature << 6) + (preview_signature >> 2);
+                preview_signature ^= size_t(predicted_image_map) + size_t(0x9e3779b9) + (preview_signature << 6) +
+                                     (preview_signature >> 2);
+                preview_signature ^= size_t(interactive_image_map_preview) + size_t(0x9e3779b9) + (preview_signature << 6) +
+                                     (preview_signature >> 2);
+                const Transform3d preview_mesh_to_world = world_matrix();
+                // Rotation and scaling change which texture direction lies in
+                // a physical layer. Rebuild the prediction when either
+                // changes; translation does not affect the filter geometry.
+                for (Eigen::Index row = 0; row < 3; ++row) {
+                    for (Eigen::Index column = 0; column < 3; ++column) {
+                        const size_t transform_value = std::hash<double>{}(preview_mesh_to_world.linear()(row, column));
+                        preview_signature ^= transform_value + size_t(0x9e3779b9) + (preview_signature << 6) +
+                                             (preview_signature >> 2);
+                    }
+                }
+                if (image_map_data != image_map_source_preview_data || preview_signature != image_map_source_preview_signature) {
+                    // Keep the last completed preview visible while its
+                    // replacement is computed. Clearing it here made every
+                    // debounced settings edit blank the object at 2%.
+                    if (image_map_source_preview_job)
+                        image_map_source_preview_job->cancel.store(true, std::memory_order_relaxed);
+                    image_map_source_preview_data      = image_map_data;
+                    image_map_source_preview_signature = preview_signature;
+                    image_map_source_preview_job       = start_source_color_preview(model_volume->mesh_ptr(), image_map_data,
+                                                                                    std::move(preview_components), std::move(assignments),
+                                                                                    model_volume->name, *image_map_render_mode,
+                                                                                    quantized_image_map, predicted_image_map,
+                                                                                    preview_mesh_to_world,
+                                                                                    interactive_image_map_preview);
+                }
+
+                if (image_map_source_preview_job) {
+                    const SourceColorPreviewStatus status = image_map_source_preview_job->status.load(std::memory_order_acquire);
+                    if (status == SourceColorPreviewStatus::Ready) {
+                        // Upload exactly once on the first render that observes
+                        // the completed worker result. The previous inverted
+                        // exchange skipped this render and could leave a modal
+                        // settings preview permanently parked at 99%.
+                        if (!image_map_source_preview_job->ready_presented.exchange(true, std::memory_order_acq_rel)) {
+                            std::unique_ptr<GUI::GLModel::Geometry> geometry;
+                            std::vector<SourceTexturePreviewPart>   texture_parts;
+                            {
+                                std::lock_guard<std::mutex> lock(image_map_source_preview_job->result_mutex);
+                                geometry      = std::move(image_map_source_preview_job->geometry);
+                                texture_parts = std::move(image_map_source_preview_job->texture_parts);
+                            }
+                            // Swap the complete result as a unit only after
+                            // the worker has finished. A preview may contain
+                            // both background geometry and texture overlays.
+                            image_map_source_model.reset();
+                            image_map_source_texture_models.clear();
+                            image_map_source_textures.clear();
+                            image_map_source_texture_transparent_wraps.clear();
+                            if (geometry && geometry->vertices_count() != 0 && geometry->indices_count() != 0) {
+                                image_map_source_model.init_from(std::move(*geometry));
+                            }
+                            if (!texture_parts.empty()) {
+                                image_map_source_texture_models.resize(texture_parts.size());
+                                image_map_source_textures.resize(texture_parts.size());
+                                image_map_source_texture_transparent_wraps.resize(texture_parts.size());
+                                for (size_t part_index = 0; part_index < texture_parts.size(); ++part_index) {
+                                    SourceTexturePreviewPart& part = texture_parts[part_index];
+                                    image_map_source_texture_transparent_wraps[part_index] = {
+                                        part.wrap_u == ImageMap::WrapMode::Transparent,
+                                        part.wrap_v == ImageMap::WrapMode::Transparent};
+                                    if (!part.geometry || part.geometry->is_empty() || part.rgba.empty())
+                                        continue;
+                                    image_map_source_texture_models[part_index].init_from(std::move(*part.geometry));
+                                    auto texture = std::make_unique<ColorinRawTexture>();
+                                    if (!texture->load_from_raw_data(std::move(part.rgba), part.width, part.height, false, false)) {
+                                        image_map_source_texture_models[part_index].reset();
+                                        continue;
+                                    }
+                                    glsafe(::glBindTexture(GL_TEXTURE_2D, texture->get_id()));
+                                    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
+                                    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
+                                    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                                                             part.wrap_u == ImageMap::WrapMode::Repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE));
+                                    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                                                             part.wrap_v == ImageMap::WrapMode::Repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE));
+                                    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0));
+                                    glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
+                                    image_map_source_textures[part_index] = std::move(texture);
+                                }
+                            }
+                            image_map_source_preview_job->progress.store(99, std::memory_order_relaxed);
+                            image_map_source_preview_job->status.store(SourceColorPreviewStatus::Uploading, std::memory_order_release);
+                        }
+                    } else if (status == SourceColorPreviewStatus::Uploaded) {
+                        if (!image_map_source_preview_job->uploaded_presented.exchange(true, std::memory_order_acq_rel))
+                            image_map_source_preview_job.reset();
+                    } else if (status == SourceColorPreviewStatus::Cancelled || status == SourceColorPreviewStatus::Failed) {
+                        image_map_source_preview_job.reset();
+                    }
+                }
+
+                const bool has_texture_preview = image_map_source_texture_models.size() == image_map_source_textures.size() &&
+                                                 image_map_source_texture_models.size() ==
+                                                     image_map_source_texture_transparent_wraps.size() &&
+                                                 std::any_of(image_map_source_texture_models.begin(), image_map_source_texture_models.end(),
+                                                             [this](const GUI::GLModel& texture_model) {
+                                                                 const size_t index = size_t(&texture_model -
+                                                                                             image_map_source_texture_models.data());
+                                                                 return texture_model.is_initialized() &&
+                                                                        image_map_source_textures[index] != nullptr &&
+                                                                        image_map_source_textures[index]->get_id() != 0;
+                                                             });
+                if (image_map_source_model.is_initialized() || has_texture_preview) {
+                    color_volume                = true;
+                    source_color_volume         = true;
+                    palette_source_color_volume = predicted_image_map &&
+                                                  (quantized_image_map ||
+                                                   *image_map_render_mode == ImageMap::RenderMode::AdaptiveLocalizedCycles);
+                    adaptive_source_color_volume = predicted_image_map &&
+                                                   *image_map_render_mode == ImageMap::RenderMode::AdaptiveLocalizedCycles;
+                } else if (image_map_source_preview_job) {
+                    // Do not show the photographic source texture as if it
+                    // were an attainable print while the first KM/K-S preview
+                    // is still being prepared.
+                    source_color_volume = true;
+                }
+            }
+            // Exact facet reconstruction remains a slice-time task.
+            break;
+        }
+
+    } while (0);
+    (void)color_volume;
+    (void)model_object;
+
+    if (!source_color_volume)
+        return false;
+    // Nothing uploaded yet: let PrusaSlicer draw the plain volume while the worker prepares the preview.
+    if (!image_map_source_model.is_initialized() &&
+        std::none_of(image_map_source_texture_models.begin(), image_map_source_texture_models.end(),
+                     [](const GUI::GLModel& m) { return m.is_initialized(); }))
+        return false;
+
+    const bool is_left_handed = this->is_left_handed();
+    if (is_left_handed)
+        glsafe(::glFrontFace(GL_CW));
+    glsafe(::glCullFace(GL_BACK));
+
+    if (source_color_volume) {
+        const bool has_texture_preview = image_map_source_texture_models.size() == image_map_source_textures.size() &&
+                                         image_map_source_texture_models.size() == image_map_source_texture_transparent_wraps.size() &&
+                                         std::any_of(image_map_source_texture_models.begin(), image_map_source_texture_models.end(),
+                                                     [this](const GUI::GLModel& texture_model) {
+                                                         const size_t index = size_t(&texture_model -
+                                                                                     image_map_source_texture_models.data());
+                                                         return texture_model.is_initialized() &&
+                                                                image_map_source_textures[index] != nullptr &&
+                                                                image_map_source_textures[index]->get_id() != 0;
+                                                     });
+        if (has_texture_preview && GUI::wxGetApp().plater() != nullptr) {
+            if (image_map_source_model.is_initialized()) {
+                ColorRGBA background_color = ColorRGBA::WHITE();
+                background_color.a(render_color.a());
+                image_map_source_model.set_color(background_color);
+                if (shader != nullptr && palette_source_color_volume) {
+                    shader->set_uniform("image_map_cycle_preview", true);
+                    shader->set_uniform("image_map_highlight_filament_id",
+                                        adaptive_source_color_volume ? int(image_map_highlight_filament_id) : 0);
+                }
+                image_map_source_model.render();
+                if (shader != nullptr && palette_source_color_volume) {
+                    shader->set_uniform("image_map_cycle_preview", false);
+                    shader->set_uniform("image_map_highlight_filament_id", 0);
+                }
+            }
+
+            GLShaderProgram* texture_shader = GUI::wxGetApp().get_shader("image_map_texture_preview");
+            if (texture_shader != nullptr) {
+                const Transform3d  model_matrix       = world_matrix();
+                const Transform3d  view_model_matrix  = view_matrix * model_matrix;
+                const Matrix3d     view_normal_matrix = view_matrix.matrix().block(0, 0, 3, 3) *
+                                                    model_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
+                const std::array<float, 2> texture_z_range = z_range;
+                ColorRGBA                  source_color    = ColorRGBA::WHITE();
+                source_color.a(render_color.a());
+
+                texture_shader->start_using();
+                texture_shader->set_uniform("view_model_matrix", view_model_matrix);
+                texture_shader->set_uniform("projection_matrix", projection_matrix);
+                texture_shader->set_uniform("view_normal_matrix", view_normal_matrix);
+                texture_shader->set_uniform("volume_world_matrix", model_matrix);
+                texture_shader->set_uniform("z_range", texture_z_range);
+                texture_shader->set_uniform("uniform_texture", 0);
+                texture_shader->set_uniform("image_map_cycle_preview", palette_source_color_volume);
+                texture_shader->set_uniform("image_map_highlight_filament_id",
+                                            adaptive_source_color_volume ? int(image_map_highlight_filament_id) : 0);
+                glsafe(::glActiveTexture(GL_TEXTURE0));
+                const bool blend_enabled = glIsEnabled(GL_BLEND) == GL_TRUE;
+                const bool polygon_offset_enabled = glIsEnabled(GL_POLYGON_OFFSET_FILL) == GL_TRUE;
+                GLint      depth_function = GL_LESS;
+                GLint      blend_src_rgb  = GL_ONE;
+                GLint      blend_dst_rgb  = GL_ZERO;
+                GLint      blend_src_alpha = GL_ONE;
+                GLint      blend_dst_alpha = GL_ZERO;
+                GLfloat    polygon_offset_factor = 0.f;
+                GLfloat    polygon_offset_units  = 0.f;
+                glsafe(::glGetIntegerv(GL_DEPTH_FUNC, &depth_function));
+                glsafe(::glGetIntegerv(GL_BLEND_SRC_RGB, &blend_src_rgb));
+                glsafe(::glGetIntegerv(GL_BLEND_DST_RGB, &blend_dst_rgb));
+                glsafe(::glGetIntegerv(GL_BLEND_SRC_ALPHA, &blend_src_alpha));
+                glsafe(::glGetIntegerv(GL_BLEND_DST_ALPHA, &blend_dst_alpha));
+                glsafe(::glGetFloatv(GL_POLYGON_OFFSET_FACTOR, &polygon_offset_factor));
+                glsafe(::glGetFloatv(GL_POLYGON_OFFSET_UNITS, &polygon_offset_units));
+                glsafe(::glEnable(GL_BLEND));
+                glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+                glsafe(::glEnable(GL_POLYGON_OFFSET_FILL));
+                glsafe(::glPolygonOffset(-1.f, -1.f));
+                glsafe(::glDepthFunc(GL_LEQUAL));
+                for (size_t index = 0; index < image_map_source_texture_models.size(); ++index) {
+                    if (!image_map_source_texture_models[index].is_initialized() || image_map_source_textures[index] == nullptr ||
+                        image_map_source_textures[index]->get_id() == 0)
+                        continue;
+                    texture_shader->set_uniform("transparent_wrap_u", image_map_source_texture_transparent_wraps[index][0]);
+                    texture_shader->set_uniform("transparent_wrap_v", image_map_source_texture_transparent_wraps[index][1]);
+                    glsafe(::glBindTexture(GL_TEXTURE_2D, image_map_source_textures[index]->get_id()));
+                    image_map_source_texture_models[index].set_color(source_color);
+                    image_map_source_texture_models[index].render();
+                }
+                glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
+                glsafe(::glDepthFunc(depth_function));
+                glsafe(::glPolygonOffset(polygon_offset_factor, polygon_offset_units));
+                if (!polygon_offset_enabled)
+                    glsafe(::glDisable(GL_POLYGON_OFFSET_FILL));
+                glsafe(::glBlendFuncSeparate(blend_src_rgb, blend_dst_rgb, blend_src_alpha, blend_dst_alpha));
+                if (!blend_enabled)
+                    glsafe(::glDisable(GL_BLEND));
+                texture_shader->stop_using();
+                if (shader != nullptr)
+                    shader->start_using();
+            }
+            if (image_map_source_preview_job &&
+                image_map_source_preview_job->status.load(std::memory_order_acquire) == SourceColorPreviewStatus::Uploading) {
+                image_map_source_preview_job->progress.store(100, std::memory_order_relaxed);
+                image_map_source_preview_job->status.store(SourceColorPreviewStatus::Uploaded, std::memory_order_release);
+            }
+        } else if (image_map_source_model.is_initialized()) {
+            ColorRGBA source_color = ColorRGBA::WHITE();
+            source_color.a(render_color.a());
+            image_map_source_model.set_color(source_color);
+            if (shader != nullptr && palette_source_color_volume) {
+                shader->set_uniform("image_map_cycle_preview", true);
+                shader->set_uniform("image_map_highlight_filament_id",
+                                    adaptive_source_color_volume ? int(image_map_highlight_filament_id) : 0);
+            }
+            image_map_source_model.render();
+            if (image_map_source_preview_job &&
+                image_map_source_preview_job->status.load(std::memory_order_acquire) == SourceColorPreviewStatus::Uploading) {
+                image_map_source_preview_job->progress.store(100, std::memory_order_relaxed);
+                image_map_source_preview_job->status.store(SourceColorPreviewStatus::Uploaded, std::memory_order_release);
+            }
+            if (shader != nullptr && palette_source_color_volume) {
+                shader->set_uniform("image_map_cycle_preview", false);
+                shader->set_uniform("image_map_highlight_filament_id", 0);
+            }
+        }
+    }
+
+    if (is_left_handed)
+        glsafe(::glFrontFace(GL_CCW));
+    return true;
+}
+
 bool GLVolume::is_sla_support() const { return this->composite_id.volume_id == -int(slaposSupportTree); }
 bool GLVolume::is_sla_pad() const { return this->composite_id.volume_id == -int(slaposPad); }
 
@@ -2565,7 +2986,9 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType type, bool disab
             shader->set_uniform("view_model_matrix", view_matrix * world_matrix);
             shader->set_uniform("projection_matrix", projection_matrix);
             shader->set_uniform("view_normal_matrix", view_normal_matrix);
-            volume.first->render();
+            // Prusa Colorin (V2c): image-map volumes show their source-colour preview when it is ready.
+            if (!volume.first->render_image_map_source_preview(view_matrix, projection_matrix, m_z_range))
+                volume.first->render();
 
 #if ENABLE_ENVIRONMENT_MAP
             if (use_environment_texture)
