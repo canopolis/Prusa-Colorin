@@ -37,10 +37,26 @@
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/MultipleBeds.hpp"
 #include "libslic3r/ImageMap/VolumeData.hpp"
+// Prusa Colorin (Orca FullSpectrum 0.9.18): image-map / mixed-filament preview.
+#include "MixedColorMatchHelpers.hpp"
+#include "libslic3r/MixedFilament.hpp"
+#include "libslic3r/ImageMap/ContinuousColorSolver.hpp"
+#include "libslic3r/ImageMap/SimplePmCalibration.hpp"
+#include "libslic3r/ImageMap/FacetRasterizer.hpp"
+#include "libslic3r/ImageMap/Sampling.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <cmath>
+#include <functional>
+#include <limits>
+#include <map>
 #include <mutex>
+#include <thread>
+#include <tuple>
+#include <unordered_map>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -285,6 +301,1400 @@ struct SourceColorPreviewJob
     std::unique_ptr<GUI::GLModel::Geometry>     geometry;
     std::vector<SourceTexturePreviewPart>       texture_parts;
 };
+
+// Prusa Colorin (Orca FullSpectrum 0.9.18): source-colour / texture preview helpers (V2a).
+namespace {
+
+// Preserve enough facial/texture detail for large scanned OBJs. Rasterization
+// is bounded, cancellable and runs off the UI thread, so this can be materially
+// higher than the old emergency cap without bringing back transform stalls.
+constexpr size_t       k_source_color_preview_triangle_cap = 200'000;
+constexpr size_t       k_source_color_preview_cache_cap    = 65'536;
+constexpr unsigned int k_source_texture_preview_max_edge   = 2'048;
+constexpr size_t       k_source_texture_preview_max_pixels = size_t(2'048) * size_t(2'048);
+constexpr unsigned int k_interactive_texture_preview_max_edge   = 2'048;
+constexpr size_t       k_interactive_texture_preview_max_pixels = size_t(2) * size_t(1'024) * size_t(1'024);
+
+struct SourceColorPreviewAssignment
+{
+    uint32_t                                        zone_index{0};
+    RGBA                                            target_color{1.f, 1.f, 1.f, 1.f};
+    unsigned int                                    filament_id{0};
+    RGBA                                            display_color{1.f, 1.f, 1.f, 1.f};
+    std::vector<ImageMap::ContinuousColorComponent> components;
+};
+
+const SourceColorPreviewAssignment* nearest_source_color_assignment(const std::vector<SourceColorPreviewAssignment>& assignments,
+                                                                    const RGBA&                                      color,
+                                                                    std::optional<uint32_t> zone_index = std::nullopt)
+{
+    const SourceColorPreviewAssignment* best_assignment = nullptr;
+    double                              best_distance   = std::numeric_limits<double>::infinity();
+    for (const SourceColorPreviewAssignment& assignment : assignments) {
+        if (zone_index && assignment.zone_index != *zone_index)
+            continue;
+        double distance = 0.0;
+        for (size_t component = 0; component < 3; ++component) {
+            const double delta = double(color[component]) - double(assignment.target_color[component]);
+            distance += delta * delta;
+        }
+        if (distance < best_distance) {
+            best_distance   = distance;
+            best_assignment = &assignment;
+        }
+    }
+    return best_assignment;
+}
+
+unsigned int nearest_source_color_filament(const std::vector<SourceColorPreviewAssignment>& assignments,
+                                           const RGBA&                                      color,
+                                           std::optional<uint32_t>                          zone_index = std::nullopt)
+{
+    const SourceColorPreviewAssignment* assignment = nearest_source_color_assignment(assignments, color, zone_index);
+    return assignment != nullptr ? assignment->filament_id : 0;
+}
+
+size_t source_color_preview_signature(const std::vector<ImageMap::ContinuousColorComponent>& components)
+{
+    size_t seed         = components.size();
+    auto   hash_combine = [&seed](size_t value) { seed ^= value + size_t(0x9e3779b9) + (seed << 6) + (seed >> 2); };
+    hash_combine(size_t(ImageMap::simple_pm_calibration_revision()));
+    for (const ImageMap::ContinuousColorComponent& component : components) {
+        hash_combine(std::hash<std::string>{}(component.color_hex));
+        hash_combine(component.transmission_distance_mm ? std::hash<double>{}(*component.transmission_distance_mm) : 0u);
+        hash_combine(component.material_id ? std::hash<std::string>{}(*component.material_id) : 0u);
+    }
+    return seed;
+}
+
+size_t source_color_preview_zone_signature(const ImageMap::VolumeData& data)
+{
+    size_t seed = data.zones.size();
+    auto hash_combine = [&seed](size_t value) { seed ^= value + size_t(0x9e3779b9) + (seed << 6) + (seed >> 2); };
+    auto hash_scalar = [&hash_combine](double value) { hash_combine(std::hash<double>{}(value)); };
+    for (const ImageMap::Zone& zone : data.zones) {
+        hash_combine(size_t(zone.enabled));
+        hash_combine(static_cast<size_t>(zone.render_mode));
+        hash_combine(static_cast<size_t>(zone.color_mix_model));
+        hash_scalar(zone.modulation_sample_spacing_mm);
+        hash_combine(size_t(zone.disable_broad_path_smoothing));
+        hash_scalar(zone.gaussian_smoothing_strength);
+        hash_scalar(zone.first_path_smoothing_strength);
+        hash_scalar(zone.second_path_smoothing_strength);
+        hash_scalar(zone.corner_smoothing_radius_mm);
+        hash_scalar(zone.tone_gamma);
+        hash_scalar(zone.overhang_contrast_percent);
+        hash_scalar(zone.image_exposure_ev);
+        hash_scalar(zone.image_contrast_percent);
+        hash_scalar(zone.image_saturation_percent);
+        hash_scalar(zone.image_edge_boost_percent);
+    }
+    return seed;
+}
+
+bool source_color_preview_components_equal(const std::vector<ImageMap::ContinuousColorComponent>& lhs,
+                                           const std::vector<ImageMap::ContinuousColorComponent>& rhs)
+{
+    if (lhs.size() != rhs.size())
+        return false;
+    for (size_t index = 0; index < lhs.size(); ++index) {
+        if (lhs[index].color_hex != rhs[index].color_hex ||
+            lhs[index].transmission_distance_mm != rhs[index].transmission_distance_mm ||
+            lhs[index].material_id != rhs[index].material_id)
+            return false;
+    }
+    return true;
+}
+
+std::shared_ptr<const ImageMap::ContinuousColorSolver> source_color_preview_solver(
+    const std::vector<ImageMap::ContinuousColorComponent>& components,
+    ImageMap::ColorMixModel                                color_mix_model)
+{
+    struct CacheEntry
+    {
+        ImageMap::ColorMixModel                         color_mix_model{ImageMap::ColorMixModel::FullSpectrumKmKs};
+        uint64_t                                        calibration_revision{0};
+        std::vector<ImageMap::ContinuousColorComponent> components;
+        std::shared_ptr<const ImageMap::ContinuousColorSolver> solver;
+    };
+    struct CacheState
+    {
+        std::mutex              mutex;
+        std::vector<CacheEntry> entries;
+    };
+
+    // Solver construction includes generating and predicting the complete
+    // printable candidate set. Live controls used to launch that same work in
+    // every replacement job; cancellation cannot interrupt the constructor,
+    // so those obsolete jobs accumulated at 2%. Serialize cache misses and
+    // retain a small set covering the active filament/model configurations.
+    // Preview workers are detached and may still be winding down during GUI
+    // shutdown, so keep this process-lifetime state out of static destruction.
+    static CacheState*          cache = new CacheState;
+    std::lock_guard<std::mutex> lock(cache->mutex);
+    const uint64_t calibration_revision = ImageMap::simple_pm_calibration_revision();
+    const auto cached = std::find_if(cache->entries.begin(), cache->entries.end(), [&components, color_mix_model, calibration_revision](const CacheEntry& entry) {
+        return entry.color_mix_model == color_mix_model && entry.calibration_revision == calibration_revision &&
+               source_color_preview_components_equal(entry.components, components);
+    });
+    if (cached != cache->entries.end())
+        return cached->solver;
+
+    auto solver = std::make_shared<ImageMap::ContinuousColorSolver>(components, color_mix_model);
+    if (!solver->valid())
+        return {};
+    constexpr size_t maximum_cached_solvers = 12;
+    if (cache->entries.size() >= maximum_cached_solvers)
+        cache->entries.erase(cache->entries.begin());
+    cache->entries.push_back(CacheEntry{color_mix_model, calibration_revision, components, solver});
+    return solver;
+}
+
+std::vector<ImageMap::ContinuousColorComponent> source_color_preview_components()
+{
+    std::vector<ImageMap::ContinuousColorComponent> components;
+    // Prusa Colorin: PrusaSlicer keeps the per-extruder filament colours in the Plater config
+    // (Orca keeps them in preset_bundle->project_config).
+    const GUI::Plater* plater = GUI::wxGetApp().plater();
+    const DynamicPrintConfig* config = plater != nullptr ? plater->config() : nullptr;
+    if (config == nullptr)
+        return components;
+
+    const ConfigOptionStrings* colors = config->option<ConfigOptionStrings>("filament_colour");
+    if (colors == nullptr)
+        return components;
+    const ConfigOptionFloats* transmission_distances = config->option<ConfigOptionFloats>("filament_transmission_distance");
+    const ConfigOptionStrings* material_ids = config->option<ConfigOptionStrings>("filament_full_spectrum_material_id");
+
+    components.reserve(colors->values.size());
+    for (size_t index = 0; index < colors->values.size(); ++index) {
+        ImageMap::ContinuousColorComponent component;
+        component.color_hex = colors->values[index];
+        if (MixedFilamentManager::use_td_for_color_prediction() && transmission_distances != nullptr &&
+            index < transmission_distances->values.size()) {
+            const double td_mm = transmission_distances->values[index];
+            if (std::isfinite(td_mm) && td_mm > EPSILON)
+                component.transmission_distance_mm = td_mm;
+        }
+        if (material_ids != nullptr && index < material_ids->values.size() && !material_ids->values[index].empty())
+            component.material_id = material_ids->values[index];
+        components.emplace_back(std::move(component));
+    }
+    return components;
+}
+
+uint32_t preview_color_key(const RGBA& color)
+{
+    auto channel = [](float value) { return uint32_t(std::lround(std::clamp(value, 0.f, 1.f) * 255.f)); };
+    return (channel(color[0]) << 16) | (channel(color[1]) << 8) | channel(color[2]);
+}
+
+RGBA source_color_preview_rgba(const std::string& color_hex)
+{
+    const wxColour color = GUI::parse_mixed_color(color_hex);
+    return {float(color.Red()) / 255.f, float(color.Green()) / 255.f, float(color.Blue()) / 255.f, 1.f};
+}
+
+size_t source_color_preview_assignment_signature(const std::vector<SourceColorPreviewAssignment>& assignments)
+{
+    size_t seed         = assignments.size();
+    auto   hash_combine = [&seed](size_t value) { seed ^= value + size_t(0x9e3779b9) + (seed << 6) + (seed >> 2); };
+    for (const SourceColorPreviewAssignment& assignment : assignments) {
+        hash_combine(assignment.zone_index);
+        hash_combine(preview_color_key(assignment.target_color));
+        hash_combine(assignment.filament_id);
+        hash_combine(preview_color_key(assignment.display_color));
+        for (const ImageMap::ContinuousColorComponent& component : assignment.components) {
+            hash_combine(std::hash<std::string>{}(component.color_hex));
+            hash_combine(component.transmission_distance_mm ? std::hash<double>{}(*component.transmission_distance_mm) : 0u);
+            hash_combine(component.material_id ? std::hash<std::string>{}(*component.material_id) : 0u);
+        }
+    }
+    return seed;
+}
+
+std::array<Vec2f, 3> unwrap_source_texture_uvs(const ImageMap::SurfaceSource& source)
+{
+    std::array<Vec2f, 3> out         = source.uvs;
+    auto                 unwrap_axis = [&out](bool use_u_axis, ImageMap::WrapMode wrap_mode) {
+        if (wrap_mode != ImageMap::WrapMode::Repeat)
+            return;
+        std::array<float, 3> values{use_u_axis ? out[0].x() : out[0].y(), use_u_axis ? out[1].x() : out[1].y(),
+                                    use_u_axis ? out[2].x() : out[2].y()};
+        if (!std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); }))
+            return;
+        const bool has_repeat_evidence = std::any_of(values.begin(), values.end(), [](float value) {
+            constexpr float epsilon = 1e-6f;
+            return value < -epsilon || value > 1.f + epsilon;
+        });
+        auto       span                = [](const std::array<float, 3>& coordinates) {
+            return std::max({coordinates[0], coordinates[1], coordinates[2]}) - std::min({coordinates[0], coordinates[1], coordinates[2]});
+        };
+        const float original_span = span(values);
+        if (!has_repeat_evidence || original_span <= 0.5f)
+            return;
+
+        std::array<float, 3> best      = values;
+        float                best_span = original_span;
+        for (size_t anchor = 0; anchor < values.size(); ++anchor) {
+            std::array<float, 3> candidate = values;
+            for (size_t index = 0; index < candidate.size(); ++index) {
+                const float delta = values[index] - values[anchor];
+                candidate[index]  = values[anchor] + delta - std::round(delta);
+            }
+            const float candidate_span = span(candidate);
+            if (candidate_span + 1e-6f < best_span) {
+                best      = candidate;
+                best_span = candidate_span;
+            }
+        }
+        if (best_span >= original_span - 1e-6f)
+            return;
+        for (size_t index = 0; index < out.size(); ++index) {
+            if (use_u_axis)
+                out[index].x() = best[index];
+            else
+                out[index].y() = best[index];
+        }
+    };
+    unwrap_axis(true, source.wrap_u);
+    unwrap_axis(false, source.wrap_v);
+    return out;
+}
+
+std::pair<unsigned int, unsigned int> source_texture_preview_size(const ImageMap::TextureAsset& asset, bool interactive_preview)
+{
+    if (!asset.valid())
+        return {0, 0};
+    const unsigned int maximum_edge = interactive_preview ? k_interactive_texture_preview_max_edge : k_source_texture_preview_max_edge;
+    const size_t maximum_pixels = interactive_preview ? k_interactive_texture_preview_max_pixels : k_source_texture_preview_max_pixels;
+    double scale = std::min({1.0, double(maximum_edge) / double(asset.width), double(maximum_edge) / double(asset.height),
+                             std::sqrt(double(maximum_pixels) / (double(asset.width) * double(asset.height)))});
+    return {std::max(1u, unsigned(std::floor(double(asset.width) * scale))),
+            std::max(1u, unsigned(std::floor(double(asset.height) * scale)))};
+}
+
+double source_texture_preview_mm_per_pixel(const indexed_triangle_set&                         its,
+                                           const std::vector<const ImageMap::TriangleBinding*>& bindings,
+                                           unsigned int                                        preview_width,
+                                           unsigned int                                        preview_height)
+{
+    double model_length_sum = 0.;
+    double pixel_length_sum = 0.;
+    for (const ImageMap::TriangleBinding* binding : bindings) {
+        if (binding == nullptr || binding->triangle_index >= its.indices.size())
+            continue;
+        const stl_triangle_vertex_indices& indices = its.indices[binding->triangle_index];
+        if (indices[0] < 0 || indices[1] < 0 || indices[2] < 0 || size_t(indices[0]) >= its.vertices.size() ||
+            size_t(indices[1]) >= its.vertices.size() || size_t(indices[2]) >= its.vertices.size())
+            continue;
+        const std::array<Vec2f, 3> uvs = unwrap_source_texture_uvs(binding->source);
+        for (size_t edge = 0; edge < 3; ++edge) {
+            const size_t next = (edge + 1) % 3;
+            const Vec2f  pixel_delta((uvs[next].x() - uvs[edge].x()) * float(preview_width),
+                                    (uvs[next].y() - uvs[edge].y()) * float(preview_height));
+            const double pixel_length = double(pixel_delta.norm());
+            const double model_length = double((its.vertices[size_t(indices[next])] - its.vertices[size_t(indices[edge])]).norm());
+            if (!std::isfinite(pixel_length) || !std::isfinite(model_length) || pixel_length <= EPSILON || model_length <= EPSILON)
+                continue;
+            pixel_length_sum += pixel_length;
+            model_length_sum += model_length;
+        }
+    }
+    return pixel_length_sum > EPSILON ? std::clamp(model_length_sum / pixel_length_sum, 0.002, 2.0) : 0.05;
+}
+
+struct PreviewFilterLayout
+{
+    // An almost-horizontal mapped surface lies in one slice plane, so its
+    // reconstruction neighbourhood is genuinely two-dimensional. Side walls
+    // instead use the equal-Z scan lines below; filtering across those lines
+    // would mix different print layers in the prepare preview.
+    bool                             gaussian_is_two_dimensional{false};
+    double                           mm_per_step{0.05};
+    std::vector<std::vector<size_t>> equal_z_lines;
+};
+
+PreviewFilterLayout source_texture_preview_filter_layout(
+    const indexed_triangle_set&                         its,
+    const std::vector<const ImageMap::TriangleBinding*>& bindings,
+    unsigned int                                        preview_width,
+    unsigned int                                        preview_height,
+    const Transform3d&                                  mesh_to_world,
+    const std::atomic<bool>&                            cancel)
+{
+    PreviewFilterLayout result;
+    if (preview_width == 0 || preview_height == 0)
+        return result;
+
+    // Fit the affine texture-pixel -> world-position map represented by the
+    // bound triangles. Projection UVs are affine even when triangle edges
+    // split the image, and the Z rows remain affine on common curved targets
+    // such as cylinders. Using all corners makes the estimate insensitive to
+    // the mesh tessellation and gives us the direction tangent to a slice.
+    Eigen::Matrix3d normal_matrix = Eigen::Matrix3d::Zero();
+    Eigen::Matrix3d right_hand    = Eigen::Matrix3d::Zero();
+    size_t          sample_count  = 0;
+    for (size_t binding_index = 0; binding_index < bindings.size(); ++binding_index) {
+        if ((binding_index & 0x3ffu) == 0u && cancel.load(std::memory_order_relaxed))
+            return result;
+        const ImageMap::TriangleBinding* binding = bindings[binding_index];
+        if (binding == nullptr || binding->triangle_index >= its.indices.size())
+            continue;
+        const stl_triangle_vertex_indices& indices = its.indices[binding->triangle_index];
+        if (indices[0] < 0 || indices[1] < 0 || indices[2] < 0 || size_t(indices[0]) >= its.vertices.size() ||
+            size_t(indices[1]) >= its.vertices.size() || size_t(indices[2]) >= its.vertices.size())
+            continue;
+        const std::array<Vec2f, 3> uvs = unwrap_source_texture_uvs(binding->source);
+        for (size_t corner = 0; corner < 3; ++corner) {
+            const Eigen::Vector3d predictor(double(uvs[corner].x()) * double(preview_width),
+                                            double(uvs[corner].y()) * double(preview_height), 1.0);
+            const Vec3d world = mesh_to_world * its.vertices[size_t(indices[corner])].cast<double>();
+            if (!predictor.allFinite() || !world.allFinite())
+                continue;
+            normal_matrix.noalias() += predictor * predictor.transpose();
+            right_hand.noalias() += predictor * world.transpose();
+            ++sample_count;
+        }
+    }
+
+    Vec3d world_per_x_pixel = Vec3d::Zero();
+    Vec3d world_per_y_pixel = Vec3d::Zero();
+    bool  fitted            = false;
+    if (sample_count >= 3) {
+        Eigen::FullPivLU<Eigen::Matrix3d> decomposition(normal_matrix);
+        if (decomposition.rank() == 3) {
+            const Eigen::Matrix3d coefficients = decomposition.solve(right_hand);
+            if (coefficients.allFinite()) {
+                world_per_x_pixel = coefficients.row(0).transpose();
+                world_per_y_pixel = coefficients.row(1).transpose();
+                fitted            = true;
+            }
+        }
+    }
+
+    const double fallback_mm_per_pixel = source_texture_preview_mm_per_pixel(its, bindings, preview_width, preview_height);
+    Vec2d        equal_z_tangent(1.0, 0.0);
+    if (fitted) {
+        const Vec2d  z_gradient(world_per_x_pixel.z(), world_per_y_pixel.z());
+        const double xy_scale = std::max(world_per_x_pixel.head<2>().norm(), world_per_y_pixel.head<2>().norm());
+        // When Z changes by less than five percent of an in-plane pixel, the
+        // mapped patch is effectively coplanar with a layer and the slicer's
+        // world-XY Gaussian really can gather samples in both texture axes.
+        result.gaussian_is_two_dimensional = z_gradient.norm() <= std::max(1e-7, 0.05 * xy_scale);
+        if (!result.gaussian_is_two_dimensional && z_gradient.squaredNorm() > 1e-14)
+            equal_z_tangent = Vec2d(z_gradient.y(), -z_gradient.x()).normalized();
+    }
+
+    const bool advance_x = std::abs(equal_z_tangent.x()) >= std::abs(equal_z_tangent.y());
+    if (advance_x) {
+        const double slope       = std::abs(equal_z_tangent.x()) > 1e-12 ? equal_z_tangent.y() / equal_z_tangent.x() : 0.0;
+        const double end_offset  = -slope * double(preview_width - 1);
+        const int    minimum_bin = int(std::floor(std::min(0.0, end_offset))) - 1;
+        const int    maximum_bin = int(std::ceil(double(preview_height - 1) + std::max(0.0, end_offset))) + 1;
+        result.equal_z_lines.resize(size_t(maximum_bin - minimum_bin + 1));
+        // X-major insertion leaves every digital scan line in path order.
+        for (unsigned int x = 0; x < preview_width; ++x) {
+            if ((x & 0x1fu) == 0u && cancel.load(std::memory_order_relaxed))
+                return result;
+            for (unsigned int y = 0; y < preview_height; ++y) {
+                const int bin = int(std::lround(double(y) - slope * double(x)));
+                result.equal_z_lines[size_t(bin - minimum_bin)].emplace_back(size_t(y) * size_t(preview_width) + x);
+            }
+        }
+        if (fitted)
+            result.mm_per_step = (world_per_x_pixel + slope * world_per_y_pixel).head<2>().norm();
+    } else {
+        const double slope       = equal_z_tangent.x() / equal_z_tangent.y();
+        const double end_offset  = -slope * double(preview_height - 1);
+        const int    minimum_bin = int(std::floor(std::min(0.0, end_offset))) - 1;
+        const int    maximum_bin = int(std::ceil(double(preview_width - 1) + std::max(0.0, end_offset))) + 1;
+        result.equal_z_lines.resize(size_t(maximum_bin - minimum_bin + 1));
+        // Y-major insertion leaves every digital scan line in path order.
+        for (unsigned int y = 0; y < preview_height; ++y) {
+            if ((y & 0x1fu) == 0u && cancel.load(std::memory_order_relaxed))
+                return result;
+            for (unsigned int x = 0; x < preview_width; ++x) {
+                const int bin = int(std::lround(double(x) - slope * double(y)));
+                result.equal_z_lines[size_t(bin - minimum_bin)].emplace_back(size_t(y) * size_t(preview_width) + x);
+            }
+        }
+        if (fitted)
+            result.mm_per_step = (slope * world_per_x_pixel + world_per_y_pixel).head<2>().norm();
+    }
+    if (!std::isfinite(result.mm_per_step) || result.mm_per_step <= 0.002)
+        result.mm_per_step = fallback_mm_per_pixel;
+    result.mm_per_step = std::clamp(result.mm_per_step, 0.002, 2.0);
+    return result;
+}
+
+bool box_blur_weight_field(const std::vector<float>& source,
+                           std::vector<float>&       destination,
+                           unsigned int              width,
+                           unsigned int              height,
+                           size_t                    components,
+                           int                       radius,
+                           bool                      horizontal,
+                           const std::atomic<bool>&  cancel)
+{
+    if (radius <= 0 || source.empty()) {
+        destination = source;
+        return true;
+    }
+    destination.resize(source.size());
+    const int extent = horizontal ? int(width) : int(height);
+    const int lines  = horizontal ? int(height) : int(width);
+    auto index = [width, components, horizontal](int line, int position, size_t component) {
+        const size_t x = size_t(horizontal ? position : line);
+        const size_t y = size_t(horizontal ? line : position);
+        return (y * size_t(width) + x) * components + component;
+    };
+    const double scale = 1. / double(2 * radius + 1);
+    for (int line = 0; line < lines; ++line) {
+        if ((line & 0x1f) == 0 && cancel.load(std::memory_order_relaxed))
+            return false;
+        for (size_t component = 0; component < components; ++component) {
+            double sum = double(radius + 1) * source[index(line, 0, component)];
+            for (int tap = 1; tap <= radius; ++tap)
+                sum += source[index(line, std::min(tap, extent - 1), component)];
+            for (int position = 0; position < extent; ++position) {
+                destination[index(line, position, component)] = float(sum * scale);
+                const int remove_position = std::clamp(position - radius, 0, extent - 1);
+                const int add_position    = std::clamp(position + radius + 1, 0, extent - 1);
+                sum += source[index(line, add_position, component)] - source[index(line, remove_position, component)];
+            }
+        }
+    }
+    return true;
+}
+
+bool box_blur_weight_lines(const std::vector<float>&              source,
+                           std::vector<float>&                    destination,
+                           const std::vector<std::vector<size_t>>& lines,
+                           size_t                                 components,
+                           int                                    radius,
+                           const std::atomic<bool>&                cancel)
+{
+    if (radius <= 0 || source.empty()) {
+        destination = source;
+        return true;
+    }
+    destination.resize(source.size());
+    const double scale = 1. / double(2 * radius + 1);
+    for (size_t line_index = 0; line_index < lines.size(); ++line_index) {
+        if ((line_index & 0x1fu) == 0u && cancel.load(std::memory_order_relaxed))
+            return false;
+        const std::vector<size_t>& line = lines[line_index];
+        if (line.empty())
+            continue;
+        const int extent = int(line.size());
+        for (size_t component = 0; component < components; ++component) {
+            auto value = [&source, &line, components, component](int position) {
+                return source[line[size_t(position)] * components + component];
+            };
+            double sum = double(radius + 1) * value(0);
+            for (int tap = 1; tap <= radius; ++tap)
+                sum += value(std::min(tap, extent - 1));
+            for (int position = 0; position < extent; ++position) {
+                destination[line[size_t(position)] * components + component] = float(sum * scale);
+                const int remove_position = std::clamp(position - radius, 0, extent - 1);
+                const int add_position    = std::clamp(position + radius + 1, 0, extent - 1);
+                sum += value(add_position) - value(remove_position);
+            }
+        }
+    }
+    return true;
+}
+
+bool gaussian_blur_weight_field(std::vector<float>&       field,
+                                unsigned int              width,
+                                unsigned int              height,
+                                size_t                    components,
+                                double                    sigma_pixels,
+                                const PreviewFilterLayout& layout,
+                                const std::atomic<bool>&  cancel)
+{
+    if (sigma_pixels <= 0.15 || field.empty())
+        return true;
+    constexpr int box_count = 3;
+    const double ideal_width = std::sqrt(12. * sigma_pixels * sigma_pixels / double(box_count) + 1.);
+    int          lower_width = std::max(1, int(std::floor(ideal_width)));
+    if ((lower_width & 1) == 0)
+        --lower_width;
+    const int upper_width = lower_width + 2;
+    const double numerator = 12. * sigma_pixels * sigma_pixels - double(box_count * lower_width * lower_width) -
+                             double(4 * box_count * lower_width + 3 * box_count);
+    const int lower_count = std::clamp(int(std::lround(numerator / double(-4 * lower_width - 4))), 0, box_count);
+
+    std::vector<float> temporary;
+    for (int pass = 0; pass < box_count; ++pass) {
+        const int radius = ((pass < lower_count ? lower_width : upper_width) - 1) / 2;
+        if (layout.gaussian_is_two_dimensional) {
+            if (!box_blur_weight_field(field, temporary, width, height, components, radius, true, cancel) ||
+                !box_blur_weight_field(temporary, field, width, height, components, radius, false, cancel))
+                return false;
+        } else if (!box_blur_weight_lines(field, temporary, layout.equal_z_lines, components, radius, cancel)) {
+            return false;
+        } else {
+            field.swap(temporary);
+        }
+    }
+    return true;
+}
+
+void compact_preview_weights(std::vector<float>& field, size_t components)
+{
+    for (size_t offset = 0; offset < field.size(); offset += components) {
+        float maximum = 0.f;
+        for (size_t component = 0; component < components; ++component)
+            maximum = std::max(maximum, field[offset + component]);
+        if (maximum <= EPSILON)
+            continue;
+        for (size_t component = 0; component < components; ++component)
+            field[offset + component] = std::clamp(field[offset + component] / maximum, 0.f, 1.f);
+    }
+}
+
+bool triangular_preview_smoothing(std::vector<float>&       field,
+                                  const PreviewFilterLayout& layout,
+                                  size_t                    components,
+                                  double                    radius_steps,
+                                  const std::atomic<bool>&  cancel)
+{
+    if (radius_steps <= 0.5 || field.empty())
+        return true;
+    std::vector<float>  smoothed(field);
+    auto range_sum = [](const std::vector<double>& values, int begin, int end) {
+        return end >= begin ? values[size_t(end + 1)] - values[size_t(begin)] : 0.;
+    };
+    for (size_t line_index = 0; line_index < layout.equal_z_lines.size(); ++line_index) {
+        if ((line_index & 0x1fu) == 0u && cancel.load(std::memory_order_relaxed))
+            return false;
+        const std::vector<size_t>& line = layout.equal_z_lines[line_index];
+        if (line.size() < 2)
+            continue;
+        std::vector<double> prefix(line.size() + 1);
+        std::vector<double> indexed_prefix(line.size() + 1);
+        for (size_t component = 0; component < components; ++component) {
+            prefix[0] = indexed_prefix[0] = 0.;
+            for (size_t position = 0; position < line.size(); ++position) {
+                const double inset = 1. - double(field[line[position] * components + component]);
+                prefix[position + 1]         = prefix[position] + inset;
+                indexed_prefix[position + 1] = indexed_prefix[position] + inset * double(position);
+            }
+            for (size_t position = 0; position < line.size(); ++position) {
+                const int center = int(position);
+                const int left   = std::max(0, int(std::ceil(double(center) - radius_steps)));
+                const int right  = std::min(int(line.size()) - 1, int(std::floor(double(center) + radius_steps)));
+                const double left_sum     = range_sum(prefix, left, center);
+                const double left_indexed = range_sum(indexed_prefix, left, center);
+                const double right_sum     = range_sum(prefix, center + 1, right);
+                const double right_indexed = range_sum(indexed_prefix, center + 1, right);
+                const double weighted_sum = left_sum * (1. - double(center) / radius_steps) + left_indexed / radius_steps +
+                                            right_sum * (1. + double(center) / radius_steps) - right_indexed / radius_steps;
+                const double left_count   = double(center - left + 1);
+                const double right_count  = double(std::max(0, right - center));
+                const double left_indices = 0.5 * double(left + center) * left_count;
+                const double right_indices = right_count > 0. ? 0.5 * double(center + 1 + right) * right_count : 0.;
+                const double weight_sum = left_count * (1. - double(center) / radius_steps) + left_indices / radius_steps +
+                                          right_count * (1. + double(center) / radius_steps) - right_indices / radius_steps;
+                const size_t offset = line[position] * components + component;
+                const double inset  = 1. - double(field[offset]);
+                const double filtered_inset = weight_sum > EPSILON ? std::min(inset, weighted_sum / weight_sum) : inset;
+                smoothed[offset] = float(std::clamp(1. - filtered_inset, 0., 1.));
+            }
+        }
+    }
+    field.swap(smoothed);
+    return true;
+}
+
+bool slope_limit_preview_weights(std::vector<float>&       field,
+                                 const PreviewFilterLayout& layout,
+                                 size_t                    components,
+                                 double                    sample_spacing_mm,
+                                 const std::atomic<bool>&  cancel)
+{
+    if (field.empty())
+        return true;
+    constexpr double max_displacement_mm = 0.63;
+    // Slice-time limiting runs on the resampled perimeter, where every
+    // sample-to-sample edge receives the 0.015 mm transition allowance. A
+    // preview texel may cover several of those edges (especially in 0.02 mm
+    // Ultra mode), so charging the allowance only once per texel stretches a
+    // transition and makes the prepare result visibly softer than the sliced
+    // path. Integrate the same allowance over the represented distance.
+    const double bounded_sample_spacing = std::clamp(sample_spacing_mm, 0.02, 2.0);
+    const double represented_steps      = layout.mm_per_step / bounded_sample_spacing;
+    const float  limit                  = float((layout.mm_per_step * 0.35 + 0.015 * represented_steps) /
+                               max_displacement_mm);
+    for (int pass = 0; pass < 4; ++pass) {
+        for (size_t line_index = 0; line_index < layout.equal_z_lines.size(); ++line_index) {
+            if ((line_index & 0x1fu) == 0u && cancel.load(std::memory_order_relaxed))
+                return false;
+            const std::vector<size_t>& line = layout.equal_z_lines[line_index];
+            if (line.size() < 2)
+                continue;
+            for (size_t component = 0; component < components; ++component) {
+                for (size_t position = 1; position < line.size(); ++position) {
+                    const size_t offset          = line[position] * components + component;
+                    const size_t previous_offset = line[position - 1] * components + component;
+                    field[offset] = std::max(field[offset], field[previous_offset] - limit);
+                }
+                for (size_t position = line.size() - 1; position-- > 0;) {
+                    const size_t offset      = line[position] * components + component;
+                    const size_t next_offset = line[position + 1] * components + component;
+                    field[offset] = std::max(field[offset], field[next_offset] - limit);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool build_perimeter_modulation_texture_preview(const ImageMap::TextureAsset&                      asset,
+                                                const ImageMap::Zone&                              zone,
+                                                const ImageMap::ContinuousColorSolver&             solver,
+                                                const indexed_triangle_set&                        its,
+                                                const std::vector<const ImageMap::TriangleBinding*>& bindings,
+                                                unsigned int                                       width,
+                                                unsigned int                                       height,
+                                                ImageMap::WrapMode                                 wrap_u,
+                                                ImageMap::WrapMode                                 wrap_v,
+                                                const Transform3d&                                 mesh_to_world,
+                                                std::atomic<bool>&                                 cancel,
+                                                const std::function<void(float)>&                   progress,
+                                                std::vector<unsigned char>&                        output)
+{
+    const size_t components = solver.component_count();
+    if (!solver.valid() || components == 0 || width == 0 || height == 0)
+        return false;
+    const size_t pixel_count = size_t(width) * size_t(height);
+    std::vector<float> weights(pixel_count * components, 0.f);
+    std::vector<float> alpha(pixel_count, 1.f);
+    constexpr size_t quantized_color_count = 32u * 32u * 32u;
+    std::vector<uint16_t> pixel_color_keys(pixel_count, 0);
+    std::vector<uint8_t>  used_color_keys(quantized_color_count, 0);
+
+    // Sampling is deliberately separate from physical-mixture lookup. A
+    // photographic row may contain thousands of new colours; doing both in
+    // one loop left progress at exactly 10% until all those KD searches had
+    // completed, which looked like a hung worker.
+    for (unsigned int y = 0; y < height; ++y) {
+        if ((y & 0x1fu) == 0u && cancel.load(std::memory_order_relaxed))
+            return false;
+        if ((y & 0x07u) == 0u && progress)
+            progress(0.18f * float(y) / float(height));
+        for (unsigned int x = 0; x < width; ++x) {
+            const Vec2f uv((float(x) + 0.5f) / float(width), (float(y) + 0.5f) / float(height));
+            RGBA sampled = ImageMap::sample_processed_texture(asset, uv, wrap_u, wrap_v, zone);
+            const size_t pixel = size_t(y) * size_t(width) + x;
+            alpha[pixel] = sampled[3];
+            for (size_t channel = 0; channel < 3; ++channel)
+                sampled[channel] = sampled[channel] * sampled[3] + (1.f - sampled[3]);
+            sampled[3] = 1.f;
+            const RGBA target = ImageMap::adjusted_modulation_target_color(sampled, zone);
+            auto quantized_channel = [&target](size_t channel) {
+                return uint32_t(std::lround(std::clamp(target[channel], 0.f, 1.f) * 31.f));
+            };
+            const uint32_t key = (quantized_channel(0) << 10) | (quantized_channel(1) << 5) | quantized_channel(2);
+            pixel_color_keys[pixel] = uint16_t(key);
+            used_color_keys[key]    = 1;
+        }
+    }
+    if (progress)
+        progress(0.18f);
+
+    std::vector<uint16_t> unique_color_keys;
+    unique_color_keys.reserve(quantized_color_count);
+    for (size_t key = 0; key < used_color_keys.size(); ++key)
+        if (used_color_keys[key] != 0)
+            unique_color_keys.emplace_back(uint16_t(key));
+
+    std::vector<float> solved_weights(quantized_color_count * components, 0.f);
+    std::atomic<size_t> next_color{0};
+    std::atomic<size_t> completed_colors{0};
+    const size_t worker_count = std::min<size_t>(4, unique_color_keys.size());
+    std::vector<std::thread> solve_workers;
+    solve_workers.reserve(worker_count);
+    for (size_t worker = 0; worker < worker_count; ++worker) {
+        solve_workers.emplace_back([&]() {
+            for (;;) {
+                const size_t color_index = next_color.fetch_add(1, std::memory_order_relaxed);
+                if (color_index >= unique_color_keys.size() || cancel.load(std::memory_order_relaxed))
+                    return;
+                const uint32_t key   = unique_color_keys[color_index];
+                const RGBA target{float((key >> 10) & 31u) / 31.f, float((key >> 5) & 31u) / 31.f,
+                                  float(key & 31u) / 31.f, 1.f};
+                // The shared solver retains this candidate index, making
+                // later slider edits a constant-time lookup.
+                std::vector<double> solved = solver.solve_quantized_5bit(target);
+                ImageMap::apply_modulation_component_contrast(solved, zone);
+                if (solved.size() == components) {
+                    const size_t offset = size_t(key) * components;
+                    for (size_t component = 0; component < components; ++component)
+                        solved_weights[offset + component] = float(solved[component]);
+                }
+                const size_t completed = completed_colors.fetch_add(1, std::memory_order_relaxed) + 1;
+                if ((completed & 0x1fu) == 0u && progress)
+                    progress(0.18f + 0.30f * float(completed) / float(std::max<size_t>(unique_color_keys.size(), 1)));
+            }
+        });
+    }
+    for (std::thread& worker : solve_workers)
+        worker.join();
+    if (cancel.load(std::memory_order_relaxed))
+        return false;
+    if (progress)
+        progress(0.48f);
+
+    for (unsigned int y = 0; y < height; ++y) {
+        if ((y & 0x1fu) == 0u && cancel.load(std::memory_order_relaxed))
+            return false;
+        if ((y & 0x0fu) == 0u && progress)
+            progress(0.48f + 0.07f * float(y) / float(height));
+        for (unsigned int x = 0; x < width; ++x) {
+            const size_t pixel         = size_t(y) * size_t(width) + x;
+            const size_t source_offset = size_t(pixel_color_keys[pixel]) * components;
+            const size_t output_offset = pixel * components;
+            std::copy_n(solved_weights.begin() + source_offset, components, weights.begin() + output_offset);
+        }
+    }
+    if (progress)
+        progress(0.55f);
+
+    const PreviewFilterLayout filter_layout =
+        source_texture_preview_filter_layout(its, bindings, width, height, mesh_to_world, cancel);
+    if (cancel.load(std::memory_order_relaxed))
+        return false;
+    if (progress)
+        progress(0.60f);
+    const double gaussian_strength = std::clamp(double(zone.gaussian_smoothing_strength), 0., 4.);
+    const double base_sigma_mm      = std::max(0.04, 0.45 * double(zone.modulation_sample_spacing_mm));
+    if (!gaussian_blur_weight_field(weights, width, height, components,
+                                    base_sigma_mm * gaussian_strength / filter_layout.mm_per_step, filter_layout, cancel))
+        return false;
+    compact_preview_weights(weights, components);
+    if (progress)
+        progress(0.69f);
+
+    if (!zone.disable_broad_path_smoothing) {
+        const double smoothing_base_mm = std::max(0.42, double(zone.corner_smoothing_radius_mm));
+        const double first_radius_mm   = std::max(0.30, 1.15 * smoothing_base_mm) *
+                                       std::clamp(double(zone.first_path_smoothing_strength), 0., 4.);
+        const double second_radius_mm = std::max(0.20, 0.45 * smoothing_base_mm) *
+                                        std::clamp(double(zone.second_path_smoothing_strength), 0., 4.);
+        if (!triangular_preview_smoothing(weights, filter_layout, components, first_radius_mm / filter_layout.mm_per_step, cancel))
+            return false;
+        if (progress)
+            progress(0.75f);
+        if (!slope_limit_preview_weights(weights, filter_layout, components, zone.modulation_sample_spacing_mm, cancel))
+            return false;
+        if (progress)
+            progress(0.80f);
+        if (!triangular_preview_smoothing(weights, filter_layout, components, second_radius_mm / filter_layout.mm_per_step, cancel))
+            return false;
+    } else {
+        if (!slope_limit_preview_weights(weights, filter_layout, components, zone.modulation_sample_spacing_mm, cancel))
+            return false;
+    }
+    if (progress)
+        progress(0.84f);
+
+    output.resize(pixel_count * 4);
+    std::unordered_map<uint64_t, RGBA> prediction_cache;
+    prediction_cache.reserve(8192);
+    std::vector<double> quantized_weights(components);
+    for (size_t pixel = 0; pixel < pixel_count; ++pixel) {
+        if ((pixel & 0xffffu) == 0u && cancel.load(std::memory_order_relaxed))
+            return false;
+        if ((pixel & 0xffffu) == 0u && progress)
+            progress(0.84f + 0.16f * float(double(pixel) / double(pixel_count)));
+        uint64_t key = 0;
+        for (size_t component = 0; component < components; ++component) {
+            const uint64_t quantized = uint64_t(std::lround(std::clamp(weights[pixel * components + component], 0.f, 1.f) * 31.f));
+            quantized_weights[component] = double(quantized) / 31.;
+            key = key * 33u + quantized;
+        }
+        auto predicted = prediction_cache.find(key);
+        if (predicted == prediction_cache.end()) {
+            const RGBA color = solver.predict_weights(quantized_weights).value_or(RGBA{1.f, 1.f, 1.f, 1.f});
+            predicted = prediction_cache.emplace(key, color).first;
+        }
+        for (size_t channel = 0; channel < 3; ++channel)
+            output[pixel * 4 + channel] = uint8_t(std::lround(std::clamp(predicted->second[channel], 0.f, 1.f) * 255.f));
+        output[pixel * 4 + 3] = uint8_t(std::lround(std::clamp(alpha[pixel], 0.f, 1.f) * 255.f));
+    }
+    if (progress)
+        progress(1.f);
+    return true;
+}
+
+std::shared_ptr<SourceColorPreviewJob> start_source_color_preview(std::shared_ptr<const TriangleMesh>             mesh,
+                                                                  std::shared_ptr<const ImageMap::VolumeData>     data,
+                                                                  std::vector<ImageMap::ContinuousColorComponent> components,
+                                                                  std::vector<SourceColorPreviewAssignment>       assignments,
+                                                                  std::string                                     volume_name,
+                                                                  ImageMap::RenderMode                            render_mode,
+                                                                  bool                                            quantize_to_palette,
+                                                                  bool                                            predicted_colors,
+                                                                  Transform3d                                     mesh_to_world,
+                                                                  bool                                            interactive_preview)
+{
+    auto job = std::make_shared<SourceColorPreviewJob>(data);
+    std::thread([job, mesh = std::move(mesh), data = std::move(data), components = std::move(components),
+                 assignments = std::move(assignments), volume_name = std::move(volume_name), render_mode, quantize_to_palette,
+                 predicted_colors, mesh_to_world = std::move(mesh_to_world), interactive_preview]() mutable {
+        const auto started_at = std::chrono::steady_clock::now();
+        try {
+            job->progress.store(2, std::memory_order_relaxed);
+            const bool adaptive_cycle_preview = predicted_colors && render_mode == ImageMap::RenderMode::AdaptiveLocalizedCycles;
+            quantize_to_palette                = predicted_colors && quantize_to_palette;
+            auto color_model_index = [](ImageMap::ColorMixModel model) {
+                return std::min<size_t>(size_t(model), size_t(ImageMap::ColorMixModel::FilamentMixer));
+            };
+            std::array<std::shared_ptr<const ImageMap::ContinuousColorSolver>, 2> shared_solvers;
+            constexpr size_t                                                     no_solver = std::numeric_limits<size_t>::max();
+            std::vector<std::shared_ptr<const ImageMap::ContinuousColorSolver>>   cycle_solvers;
+            std::vector<size_t> assignment_solver_indices(assignments.size(), no_solver);
+            if (adaptive_cycle_preview) {
+                std::unordered_map<uint64_t, size_t> solver_by_filament;
+                solver_by_filament.reserve(assignments.size());
+                for (size_t assignment_index = 0; assignment_index < assignments.size(); ++assignment_index) {
+                    if (job->cancel.load(std::memory_order_relaxed)) {
+                        job->status.store(SourceColorPreviewStatus::Cancelled, std::memory_order_release);
+                        return;
+                    }
+                    const unsigned int filament_id = assignments[assignment_index].filament_id;
+                    const ImageMap::ColorMixModel color_mix_model = assignments[assignment_index].zone_index < data->zones.size() ?
+                                                                        data->zones[assignments[assignment_index].zone_index].color_mix_model :
+                                                                        ImageMap::ColorMixModel::FullSpectrumKmKs;
+                    const uint64_t solver_key = uint64_t(filament_id) | (uint64_t(color_model_index(color_mix_model)) << 32);
+                    const auto existing = solver_by_filament.find(solver_key);
+                    if (existing != solver_by_filament.end()) {
+                        assignment_solver_indices[assignment_index] = existing->second;
+                    } else if (assignments[assignment_index].components.size() >= 2) {
+                        const size_t solver_index = cycle_solvers.size();
+                        std::shared_ptr<const ImageMap::ContinuousColorSolver> solver =
+                            source_color_preview_solver(assignments[assignment_index].components, color_mix_model);
+                        if (solver && solver->valid()) {
+                            cycle_solvers.emplace_back(std::move(solver));
+                            solver_by_filament.emplace(solver_key, solver_index);
+                            assignment_solver_indices[assignment_index] = solver_index;
+                        }
+                    }
+                    job->progress.store(2 + int(8 * (assignment_index + 1) / std::max<size_t>(assignments.size(), 1)),
+                                        std::memory_order_relaxed);
+                }
+                // Every palette target sharing a cycle reuses the same solver.
+                // Store a guaranteed-attainable fallback as well, so a failed
+                // lookup can never leak the original texture RGB into the
+                // printable-result preview.
+                for (size_t assignment_index = 0; assignment_index < assignments.size(); ++assignment_index) {
+                    const size_t solver_index = assignment_solver_indices[assignment_index];
+                    if (solver_index == no_solver || solver_index >= cycle_solvers.size())
+                        continue;
+                    if (const std::optional<RGBA> predicted = cycle_solvers[solver_index]->predict_modulation_color(
+                            assignments[assignment_index].target_color))
+                        assignments[assignment_index].display_color = *predicted;
+                }
+            } else if (!quantize_to_palette) {
+                for (const ImageMap::Zone& zone : data->zones) {
+                    if (job->cancel.load(std::memory_order_relaxed)) {
+                        job->status.store(SourceColorPreviewStatus::Cancelled, std::memory_order_release);
+                        return;
+                    }
+                    if (!zone.enabled || zone.render_mode != render_mode)
+                        continue;
+                    const size_t index = color_model_index(zone.color_mix_model);
+                    if (!shared_solvers[index])
+                        shared_solvers[index] = source_color_preview_solver(components, zone.color_mix_model);
+                }
+            }
+            if (job->cancel.load(std::memory_order_relaxed)) {
+                job->status.store(SourceColorPreviewStatus::Cancelled, std::memory_order_release);
+                return;
+            }
+            job->progress.store(10, std::memory_order_relaxed);
+
+            // Keep texture mappings on their original triangles and let the
+            // GPU interpolate the image. Projected decals are intentionally
+            // partial and use transparent UV wrapping, so they need a simple
+            // background surface plus a clipped texture overlay rather than
+            // the subdivided vertex-colour fallback below.
+            const indexed_triangle_set&                   its = mesh->its;
+            std::vector<const ImageMap::TriangleBinding*> selected(its.indices.size(), nullptr);
+            for (const ImageMap::TriangleBinding& binding : data->triangle_bindings) {
+                if (binding.triangle_index >= selected.size() || binding.zone_index >= data->zones.size())
+                    continue;
+                const ImageMap::Zone& zone = data->zones[binding.zone_index];
+                if (!zone.enabled || zone.render_mode != render_mode)
+                    continue;
+                const ImageMap::TriangleBinding* current = selected[binding.triangle_index];
+                if (current == nullptr || data->zones[current->zone_index].priority < zone.priority)
+                    selected[binding.triangle_index] = &binding;
+            }
+
+            bool texture_preview_eligible       = false;
+            bool texture_preview_needs_background = false;
+            for (const ImageMap::TriangleBinding* binding : selected) {
+                if (binding == nullptr) {
+                    texture_preview_needs_background = true;
+                    continue;
+                }
+                if (binding->source.kind != ImageMap::SourceKind::Texture || binding->source.texture_asset_index < 0 ||
+                    size_t(binding->source.texture_asset_index) >= data->texture_assets.size() ||
+                    !data->texture_assets[size_t(binding->source.texture_asset_index)].valid() ||
+                    !std::all_of(binding->source.uvs.begin(), binding->source.uvs.end(),
+                                 [](const Vec2f& uv) { return std::isfinite(uv.x()) && std::isfinite(uv.y()); })) {
+                    texture_preview_eligible = false;
+                    break;
+                }
+                texture_preview_eligible = true;
+                texture_preview_needs_background |= binding->source.wrap_u == ImageMap::WrapMode::Transparent ||
+                                                    binding->source.wrap_v == ImageMap::WrapMode::Transparent;
+            }
+
+            if (texture_preview_eligible) {
+                using TextureGroupKey = std::tuple<int32_t, uint32_t, uint8_t, uint8_t>;
+                std::map<TextureGroupKey, std::vector<const ImageMap::TriangleBinding*>> groups;
+                for (const ImageMap::TriangleBinding* binding : selected) {
+                    if (binding == nullptr)
+                        continue;
+                    groups[{binding->source.texture_asset_index, binding->zone_index, uint8_t(binding->source.wrap_u),
+                            uint8_t(binding->source.wrap_v)}]
+                        .push_back(binding);
+                }
+
+                std::unique_ptr<GUI::GLModel::Geometry> background_geometry;
+                if (texture_preview_needs_background) {
+                    background_geometry = std::make_unique<GUI::GLModel::Geometry>();
+                    background_geometry->format = {GUI::GLModel::Geometry::EPrimitiveType::Triangles,
+                                                   GUI::GLModel::Geometry::EVertexLayout::P3N3C4};
+                    background_geometry->reserve_vertices(its.indices.size() * 3);
+                    background_geometry->reserve_indices(its.indices.size() * 3);
+                    background_geometry->color = ColorRGBA::WHITE();
+                    unsigned int next_vertex = 0;
+                    for (size_t triangle_index = 0; triangle_index < its.indices.size(); ++triangle_index) {
+                        const stl_triangle_vertex_indices& indices = its.indices[triangle_index];
+                        if (indices[0] < 0 || indices[1] < 0 || indices[2] < 0 || size_t(indices[0]) >= its.vertices.size() ||
+                            size_t(indices[1]) >= its.vertices.size() || size_t(indices[2]) >= its.vertices.size())
+                            continue;
+                        const Vec3f& p0            = its.vertices[size_t(indices[0])];
+                        const Vec3f& p1            = its.vertices[size_t(indices[1])];
+                        const Vec3f& p2            = its.vertices[size_t(indices[2])];
+                        Vec3f        normal        = (p1 - p0).cross(p2 - p0);
+                        const float  normal_length = normal.norm();
+                        if (normal_length <= EPSILON)
+                            continue;
+                        normal /= normal_length;
+                        const ImageMap::TriangleBinding* binding = selected[triangle_index];
+                        const std::array<RGBA, 3> colors = binding != nullptr ? binding->source.corner_colors :
+                                                                                 std::array<RGBA, 3>{RGBA{1.f, 1.f, 1.f, 1.f},
+                                                                                                     RGBA{1.f, 1.f, 1.f, 1.f},
+                                                                                                     RGBA{1.f, 1.f, 1.f, 1.f}};
+                        background_geometry->add_vertex(p0, normal, colors[0]);
+                        background_geometry->add_vertex(p1, normal, colors[1]);
+                        background_geometry->add_vertex(p2, normal, colors[2]);
+                        background_geometry->add_triangle(next_vertex, next_vertex + 1, next_vertex + 2);
+                        next_vertex += 3;
+                    }
+                    if (background_geometry->is_empty())
+                        background_geometry.reset();
+                }
+
+                size_t total_pixels = 0;
+                for (const auto& group : groups) {
+                    const auto [width, height] =
+                        source_texture_preview_size(data->texture_assets[size_t(std::get<0>(group.first))], interactive_preview);
+                    total_pixels += size_t(width) * size_t(height);
+                }
+                size_t                                processed_pixels = 0;
+                std::vector<SourceTexturePreviewPart> texture_parts;
+                texture_parts.reserve(groups.size());
+
+                for (const auto& [group_key, bindings] : groups) {
+                    if (job->cancel.load(std::memory_order_relaxed)) {
+                        job->status.store(SourceColorPreviewStatus::Cancelled, std::memory_order_release);
+                        return;
+                    }
+                    const int32_t                 asset_index  = std::get<0>(group_key);
+                    const uint32_t                zone_index   = std::get<1>(group_key);
+                    const ImageMap::TextureAsset& asset        = data->texture_assets[size_t(asset_index)];
+                    const ImageMap::ContinuousColorSolver* shared_solver = nullptr;
+                    if (zone_index < data->zones.size()) {
+                        const size_t solver_index = color_model_index(data->zones[zone_index].color_mix_model);
+                        if (shared_solvers[solver_index] && shared_solvers[solver_index]->valid())
+                            shared_solver = shared_solvers[solver_index].get();
+                    }
+                    const auto [preview_width, preview_height] = source_texture_preview_size(asset, interactive_preview);
+                    if (preview_width == 0 || preview_height == 0)
+                        continue;
+
+                    SourceTexturePreviewPart part;
+                    part.width            = preview_width;
+                    part.height           = preview_height;
+                    part.wrap_u           = ImageMap::WrapMode(std::get<2>(group_key));
+                    part.wrap_v           = ImageMap::WrapMode(std::get<3>(group_key));
+                    part.geometry         = std::make_unique<GUI::GLModel::Geometry>();
+                    part.geometry->format = {GUI::GLModel::Geometry::EPrimitiveType::Triangles,
+                                             GUI::GLModel::Geometry::EVertexLayout::P3N3T2};
+                    part.geometry->reserve_vertices(bindings.size() * 3);
+                    part.geometry->reserve_indices(bindings.size() * 3);
+                    part.geometry->color = ColorRGBA::WHITE();
+
+                    unsigned int next_vertex = 0;
+                    for (const ImageMap::TriangleBinding* binding : bindings) {
+                        if (binding->triangle_index >= its.indices.size())
+                            continue;
+                        const stl_triangle_vertex_indices& indices = its.indices[binding->triangle_index];
+                        if (indices[0] < 0 || indices[1] < 0 || indices[2] < 0 || size_t(indices[0]) >= its.vertices.size() ||
+                            size_t(indices[1]) >= its.vertices.size() || size_t(indices[2]) >= its.vertices.size())
+                            continue;
+                        const Vec3f& p0            = its.vertices[size_t(indices[0])];
+                        const Vec3f& p1            = its.vertices[size_t(indices[1])];
+                        const Vec3f& p2            = its.vertices[size_t(indices[2])];
+                        Vec3f        normal        = (p1 - p0).cross(p2 - p0);
+                        const float  normal_length = normal.norm();
+                        if (normal_length <= EPSILON)
+                            continue;
+                        normal /= normal_length;
+                        const std::array<Vec2f, 3> uvs = unwrap_source_texture_uvs(binding->source);
+                        part.geometry->add_vertex(p0, normal, uvs[0]);
+                        part.geometry->add_vertex(p1, normal, uvs[1]);
+                        part.geometry->add_vertex(p2, normal, uvs[2]);
+                        part.geometry->add_triangle(next_vertex, next_vertex + 1, next_vertex + 2);
+                        next_vertex += 3;
+                    }
+                    if (part.geometry->is_empty())
+                        continue;
+
+                    struct CachedTextureColor
+                    {
+                        RGBA         color{1.f, 1.f, 1.f, 1.f};
+                        unsigned int filament_id{0};
+                    };
+                    std::unordered_map<uint32_t, CachedTextureColor> color_cache;
+                    color_cache.reserve(32u * 32u * 32u);
+                    part.rgba.resize(size_t(preview_width) * size_t(preview_height) * 4);
+
+                    auto source_channel = [&asset, preview_width, preview_height](unsigned int x, unsigned int y, size_t channel) {
+                        if (preview_width == asset.width && preview_height == asset.height)
+                            return float(asset.rgba[(size_t(y) * size_t(asset.width) + x) * 4 + channel]);
+                        const float  source_x = std::clamp((float(x) + 0.5f) * float(asset.width) / float(preview_width) - 0.5f, 0.f,
+                                                           float(asset.width - 1));
+                        const float  source_y = std::clamp((float(y) + 0.5f) * float(asset.height) / float(preview_height) - 0.5f, 0.f,
+                                                           float(asset.height - 1));
+                        const size_t x0       = size_t(std::floor(source_x));
+                        const size_t y0       = size_t(std::floor(source_y));
+                        const size_t x1       = std::min(x0 + 1, size_t(asset.width - 1));
+                        const size_t y1       = std::min(y0 + 1, size_t(asset.height - 1));
+                        const float  tx       = source_x - float(x0);
+                        const float  ty       = source_y - float(y0);
+                        auto         value    = [&asset, channel](size_t sx, size_t sy) {
+                            return float(asset.rgba[(sy * size_t(asset.width) + sx) * 4 + channel]);
+                        };
+                        const float top    = value(x0, y0) + (value(x1, y0) - value(x0, y0)) * tx;
+                        const float bottom = value(x0, y1) + (value(x1, y1) - value(x0, y1)) * tx;
+                        return top + (bottom - top) * ty;
+                    };
+                    const bool raw_source_texture = assignments.empty() && (shared_solver == nullptr || !shared_solver->valid());
+                    const ImageMap::Zone* preview_zone = zone_index < data->zones.size() ? &data->zones[zone_index] : nullptr;
+                    if (predicted_colors && preview_zone != nullptr &&
+                        preview_zone->render_mode == ImageMap::RenderMode::PerimeterModulationV2 && shared_solver != nullptr &&
+                        shared_solver->valid()) {
+                        const size_t part_pixels = size_t(preview_width) * size_t(preview_height);
+                        auto update_part_progress = [job, processed_pixels, part_pixels, total_pixels](float part_progress) {
+                            const double completed = double(processed_pixels) +
+                                                     double(std::clamp(part_progress, 0.f, 1.f)) * double(part_pixels);
+                            const int requested = 10 + int(88. * completed / double(std::max<size_t>(total_pixels, 1)));
+                            int       current   = job->progress.load(std::memory_order_relaxed);
+                            while (current < requested &&
+                                   !job->progress.compare_exchange_weak(current, requested, std::memory_order_relaxed))
+                                ;
+                        };
+                        if (build_perimeter_modulation_texture_preview(asset, *preview_zone, *shared_solver, its, bindings,
+                                                                       preview_width, preview_height, part.wrap_u, part.wrap_v,
+                                                                       mesh_to_world, job->cancel, update_part_progress, part.rgba)) {
+                            processed_pixels += part_pixels;
+                            texture_parts.emplace_back(std::move(part));
+                            continue;
+                        }
+                        if (job->cancel.load(std::memory_order_relaxed)) {
+                            job->status.store(SourceColorPreviewStatus::Cancelled, std::memory_order_release);
+                            return;
+                        }
+                    }
+
+                    for (unsigned int y = 0; y < preview_height; ++y) {
+                        if ((y & 0x1fu) == 0u) {
+                            if (job->cancel.load(std::memory_order_relaxed)) {
+                                job->status.store(SourceColorPreviewStatus::Cancelled, std::memory_order_release);
+                                return;
+                            }
+                            job->progress.store(10 + int(88 * processed_pixels / std::max<size_t>(total_pixels, 1)),
+                                                std::memory_order_relaxed);
+                        }
+                        for (unsigned int x = 0; x < preview_width; ++x) {
+                            RGBA source_color;
+                            if (preview_zone != nullptr) {
+                                const Vec2f uv((float(x) + 0.5f) / float(preview_width),
+                                               (float(y) + 0.5f) / float(preview_height));
+                                source_color = ImageMap::sample_processed_texture(asset, uv, part.wrap_u, part.wrap_v, *preview_zone);
+                            } else {
+                                source_color = {source_channel(x, y, 0) / 255.f, source_channel(x, y, 1) / 255.f,
+                                                source_channel(x, y, 2) / 255.f, source_channel(x, y, 3) / 255.f};
+                            }
+                            const uint8_t source_r     = uint8_t(std::lround(std::clamp(source_color[0], 0.f, 1.f) * 255.f));
+                            const uint8_t source_g     = uint8_t(std::lround(std::clamp(source_color[1], 0.f, 1.f) * 255.f));
+                            const uint8_t source_b     = uint8_t(std::lround(std::clamp(source_color[2], 0.f, 1.f) * 255.f));
+                            const float   source_alpha = source_color[3];
+                            RGBA          target{(float(source_r) / 255.f) * source_alpha + (1.f - source_alpha),
+                                                 (float(source_g) / 255.f) * source_alpha + (1.f - source_alpha),
+                                                 (float(source_b) / 255.f) * source_alpha + (1.f - source_alpha), 1.f};
+                            if (preview_zone != nullptr && preview_zone->render_mode != ImageMap::RenderMode::NormalMix)
+                                target = ImageMap::adjusted_modulation_target_color(target, *preview_zone);
+                            const uint32_t cache_key = (uint32_t(std::lround(target[0] * 31.f)) << 10) |
+                                                       (uint32_t(std::lround(target[1] * 31.f)) << 5) |
+                                                       uint32_t(std::lround(target[2] * 31.f));
+                            auto cached = color_cache.find(cache_key);
+                            if (cached == color_cache.end()) {
+                                CachedTextureColor                  result{target, 0};
+                                const SourceColorPreviewAssignment* assignment = nearest_source_color_assignment(assignments, target,
+                                                                                                                 zone_index);
+                                if (quantize_to_palette) {
+                                    if (assignment != nullptr) {
+                                        result.color       = assignment->display_color;
+                                        result.filament_id = assignment->filament_id;
+                                    }
+                                } else if (adaptive_cycle_preview) {
+                                    if (assignment != nullptr) {
+                                        result.color                  = assignment->display_color;
+                                        result.filament_id            = assignment->filament_id;
+                                        const size_t assignment_index = size_t(assignment - assignments.data());
+                                        const size_t solver_index     = assignment_index < assignment_solver_indices.size() ?
+                                                                            assignment_solver_indices[assignment_index] :
+                                                                            no_solver;
+                                        if (solver_index != no_solver && solver_index < cycle_solvers.size() &&
+                                            cycle_solvers[solver_index] != nullptr && cycle_solvers[solver_index]->valid()) {
+                                            if (const std::optional<RGBA> predicted = cycle_solvers[solver_index]->predict_modulation_color(
+                                                    target))
+                                                result.color = *predicted;
+                                        }
+                                    }
+                                } else if (shared_solver != nullptr && shared_solver->valid()) {
+                                    if (const std::optional<RGBA> predicted = shared_solver->predict_modulation_color(target))
+                                        result.color = *predicted;
+                                    result.filament_id = nearest_source_color_filament(assignments, target, zone_index);
+                                }
+                                cached = color_cache.emplace(cache_key, result).first;
+                            }
+                            const size_t output_offset = (size_t(y) * size_t(preview_width) + x) * 4;
+                            if (raw_source_texture) {
+                                part.rgba[output_offset + 0] = source_r;
+                                part.rgba[output_offset + 1] = source_g;
+                                part.rgba[output_offset + 2] = source_b;
+                            } else {
+                                for (size_t channel = 0; channel < 3; ++channel)
+                                    part.rgba[output_offset + channel] = uint8_t(
+                                        std::lround(std::clamp(cached->second.color[channel], 0.f, 1.f) * 255.f));
+                            }
+                            part.rgba[output_offset + 3] = assignments.empty() ?
+                                                                 uint8_t(std::lround(std::clamp(source_alpha, 0.f, 1.f) * 255.f)) :
+                                                                 uint8_t(std::min(cached->second.filament_id, 255u));
+                            ++processed_pixels;
+                        }
+                    }
+                    texture_parts.emplace_back(std::move(part));
+                }
+
+                if (!texture_parts.empty()) {
+                    {
+                        std::lock_guard<std::mutex> lock(job->result_mutex);
+                        job->geometry      = std::move(background_geometry);
+                        job->texture_parts = std::move(texture_parts);
+                    }
+                    job->progress.store(99, std::memory_order_relaxed);
+                    job->status.store(SourceColorPreviewStatus::Ready, std::memory_order_release);
+                    const auto elapsed_ms =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started_at).count();
+                    BOOST_LOG_TRIVIAL(info) << "Image-map UV texture preview prepared"
+                                            << " volume=\"" << volume_name << "\""
+                                            << " groups=" << groups.size() << " source_triangles=" << its.indices.size()
+                                            << " preview_pixels=" << processed_pixels << " elapsed_ms=" << elapsed_ms;
+                    return;
+                }
+            }
+
+            ImageMap::SourceColorRasterizationOptions options;
+            options.max_leaf_triangles    = k_source_color_preview_triangle_cap;
+            options.source_data_validated = true;
+            options.cancelled             = [job]() { return job->cancel.load(std::memory_order_relaxed); };
+            options.progress              = [job](int progress) {
+                int current = job->progress.load(std::memory_order_relaxed);
+                while (current < progress && !job->progress.compare_exchange_weak(current, progress, std::memory_order_relaxed))
+                    ;
+            };
+
+            ImageMap::SourceColorRasterization rasterized = ImageMap::rasterize_source_colors(*mesh, *data, render_mode,
+                                                                                              RGBA{1.f, 1.f, 1.f, 1.f}, options);
+            if (job->cancel.load(std::memory_order_relaxed)) {
+                job->status.store(SourceColorPreviewStatus::Cancelled, std::memory_order_release);
+                return;
+            }
+
+            auto geometry                  = std::make_unique<GUI::GLModel::Geometry>();
+            geometry->format.type          = GUI::GLModel::Geometry::EPrimitiveType::Triangles;
+            geometry->format.vertex_layout = GUI::GLModel::Geometry::EVertexLayout::P3N3C4;
+            geometry->reserve_vertices(rasterized.vertices.size());
+            geometry->reserve_indices(rasterized.indices.size());
+            geometry->indices = std::move(rasterized.indices);
+            geometry->color   = ColorRGBA::WHITE();
+
+            const size_t vertex_count  = rasterized.vertices.size();
+            int          last_progress = 85;
+            struct CachedPreviewColor
+            {
+                RGBA         color{1.f, 1.f, 1.f, 1.f};
+                unsigned int filament_id{0};
+            };
+            std::unordered_map<uint32_t, CachedPreviewColor> color_cache;
+            color_cache.reserve(std::min(vertex_count, k_source_color_preview_cache_cap));
+            const ImageMap::ContinuousColorSolver* shared_solver = nullptr;
+            for (const ImageMap::Zone& zone : data->zones) {
+                if (!zone.enabled || zone.render_mode != render_mode)
+                    continue;
+                const size_t solver_index = color_model_index(zone.color_mix_model);
+                if (shared_solvers[solver_index] && shared_solvers[solver_index]->valid())
+                    shared_solver = shared_solvers[solver_index].get();
+                break;
+            }
+            for (size_t vertex_idx = 0; vertex_idx < vertex_count; ++vertex_idx) {
+                if ((vertex_idx & 0x3fffu) == 0u) {
+                    if (job->cancel.load(std::memory_order_relaxed)) {
+                        job->status.store(SourceColorPreviewStatus::Cancelled, std::memory_order_release);
+                        return;
+                    }
+                    const int progress = vertex_count == 0 ? 99 : 85 + int(14 * vertex_idx / vertex_count);
+                    if (progress != last_progress) {
+                        job->progress.store(progress, std::memory_order_relaxed);
+                        last_progress = progress;
+                    }
+                }
+                const ImageMap::SourceColorVertex& vertex = rasterized.vertices[vertex_idx];
+                RGBA         result_color = adaptive_cycle_preview ? RGBA{0.55f, 0.55f, 0.55f, vertex.color[3]} : vertex.color;
+                unsigned int filament_id  = 0;
+                if (quantize_to_palette) {
+                    const uint32_t key    = preview_color_key(vertex.color);
+                    const auto     cached = color_cache.find(key);
+                    if (cached != color_cache.end()) {
+                        result_color = cached->second.color;
+                        filament_id  = cached->second.filament_id;
+                    } else {
+                        const RGBA quantized_target{float((key >> 16) & 0xffu) / 255.f, float((key >> 8) & 0xffu) / 255.f,
+                                                    float(key & 0xffu) / 255.f, vertex.color[3]};
+                        if (const SourceColorPreviewAssignment* assignment = nearest_source_color_assignment(assignments, quantized_target);
+                            assignment != nullptr) {
+                            result_color = assignment->display_color;
+                            filament_id  = assignment->filament_id;
+                        }
+                        if (color_cache.size() < k_source_color_preview_cache_cap) {
+                            RGBA cached_color = result_color;
+                            cached_color[3]   = 1.f;
+                            color_cache.emplace(key, CachedPreviewColor{cached_color, filament_id});
+                        }
+                    }
+                } else if (adaptive_cycle_preview) {
+                    const uint32_t key    = preview_color_key(vertex.color);
+                    const auto     cached = color_cache.find(key);
+                    if (cached != color_cache.end()) {
+                        result_color = cached->second.color;
+                        filament_id  = cached->second.filament_id;
+                    } else {
+                        const RGBA quantized_target{float((key >> 16) & 0xffu) / 255.f, float((key >> 8) & 0xffu) / 255.f,
+                                                    float(key & 0xffu) / 255.f, vertex.color[3]};
+                        const SourceColorPreviewAssignment* assignment = nearest_source_color_assignment(assignments, quantized_target);
+                        if (assignment != nullptr) {
+                            filament_id                   = assignment->filament_id;
+                            result_color                  = assignment->display_color;
+                            const size_t assignment_index = size_t(assignment - assignments.data());
+                            const size_t solver_index     = assignment_index < assignment_solver_indices.size() ?
+                                                                assignment_solver_indices[assignment_index] :
+                                                                no_solver;
+                            if (solver_index != no_solver && solver_index < cycle_solvers.size() &&
+                                cycle_solvers[solver_index] != nullptr && cycle_solvers[solver_index]->valid()) {
+                                if (const std::optional<RGBA> predicted = cycle_solvers[solver_index]->predict_modulation_color(
+                                        quantized_target))
+                                    result_color = *predicted;
+                            }
+                        }
+                        if (color_cache.size() < k_source_color_preview_cache_cap) {
+                            RGBA cached_color = result_color;
+                            cached_color[3]   = 1.f;
+                            color_cache.emplace(key, CachedPreviewColor{cached_color, filament_id});
+                        }
+                    }
+                } else if (shared_solver != nullptr && shared_solver->valid()) {
+                    const uint32_t key    = preview_color_key(vertex.color);
+                    const auto     cached = color_cache.find(key);
+                    if (cached != color_cache.end()) {
+                        result_color = cached->second.color;
+                        filament_id  = cached->second.filament_id;
+                    } else {
+                        RGBA quantized_target{float((key >> 16) & 0xffu) / 255.f, float((key >> 8) & 0xffu) / 255.f,
+                                              float(key & 0xffu) / 255.f, vertex.color[3]};
+                        if (const std::optional<RGBA> predicted = shared_solver->predict_modulation_color(quantized_target))
+                            result_color = *predicted;
+                        filament_id = nearest_source_color_filament(assignments, quantized_target);
+                        if (color_cache.size() < k_source_color_preview_cache_cap) {
+                            RGBA cached_color = result_color;
+                            cached_color[3]   = 1.f;
+                            color_cache.emplace(key, CachedPreviewColor{cached_color, filament_id});
+                        }
+                    }
+                } else {
+                    filament_id = nearest_source_color_filament(assignments, vertex.color);
+                }
+                // The source-preview shader treats alpha as a compact, transient
+                // palette assignment. It restores the volume alpha before
+                // lighting, so normal image-map rendering remains opaque.
+                result_color[3] = assignments.empty() ? vertex.color[3] : float(std::min(filament_id, 255u)) / 255.f;
+                geometry->add_vertex(vertex.position, vertex.normal, result_color);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(job->result_mutex);
+                job->geometry = std::move(geometry);
+            }
+            // Keep the 99% overlay visible for one frame before the UI thread
+            // initializes and uploads the GL model.
+            job->progress.store(99, std::memory_order_relaxed);
+            job->status.store(SourceColorPreviewStatus::Ready, std::memory_order_release);
+
+            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started_at)
+                                        .count();
+            BOOST_LOG_TRIVIAL(info) << "Image-map result preview prepared"
+                                    << " volume=\"" << volume_name << "\""
+                                    << " mode=\"" << (quantize_to_palette ? "quantized" : "optical") << "\""
+                                    << " source_triangles=" << rasterized.source_triangle_count
+                                    << " preview_triangles=" << rasterized.sampled_leaf_count << " lod_passes=" << rasterized.lod_pass_count
+                                    << " elapsed_ms=" << elapsed_ms;
+        } catch (const std::exception& error) {
+            BOOST_LOG_TRIVIAL(error) << "KM/K-S image-map result preview failed"
+                                     << " volume=\"" << volume_name << "\""
+                                     << " error=\"" << error.what() << "\"";
+            job->status.store(SourceColorPreviewStatus::Failed, std::memory_order_release);
+        } catch (...) {
+            BOOST_LOG_TRIVIAL(error) << "KM/K-S image-map result preview failed"
+                                     << " volume=\"" << volume_name << "\""
+                                     << " error=\"unknown exception\"";
+            job->status.store(SourceColorPreviewStatus::Failed, std::memory_order_release);
+        }
+    }).detach();
+    return job;
+}
+
+} // namespace
 
 GLVolume::GLVolume(float r, float g, float b, float a)
     : m_sla_shift_z(0.0)
