@@ -1732,7 +1732,8 @@ static ColorRGBA interpolate_preview_gradient_color(const ColorRGBA& a, const Co
     ColorRGBA out;
     local = std::clamp(local, 0.0, 1.0);
     for (size_t channel = 0; channel < 4; ++channel)
-        out[channel] = float(double(a[channel]) * (1.0 - local) + double(b[channel]) * local);
+        // Prusa Colorin: PrusaSlicer ColorRGBA has no operator[] (Orca has); use data()/set().
+        out.set(static_cast<unsigned int>(channel), float(double(a.data()[channel]) * (1.0 - local) + double(b.data()[channel]) * local));
     return out;
 }
 
