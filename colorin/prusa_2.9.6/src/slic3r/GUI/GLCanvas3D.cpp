@@ -2232,6 +2232,8 @@ void GLCanvas3D::render()
     }
 
     _render_overlays();
+    // Prusa Colorin (V3): progress of the image-map colour preview; keeps refreshing until it is shown.
+    _render_source_color_preview_progress();
 
     _render_bed_selector();
 
@@ -3632,6 +3634,69 @@ void GLCanvas3D::on_render_timer(wxTimerEvent& evt)
     //wxWakeUpIdle();
 }
 
+
+// Prusa Colorin (Orca FullSpectrum 0.9.18, V3): image-map preview hooks of the 3D canvas.
+void GLCanvas3D::set_image_map_highlight_filament_id(unsigned int filament_id)
+{
+    m_image_map_highlight_filament_id = filament_id;
+    for (GLVolume* volume : m_volumes.volumes) {
+        if (volume != nullptr)
+            volume->image_map_highlight_filament_id = filament_id;
+    }
+    set_as_dirty();
+}
+
+void GLCanvas3D::set_image_map_preview_override(int object_index, int volume_index, std::shared_ptr<const ImageMap::VolumeData> preview_data)
+{
+    for (GLVolume* volume : m_volumes.volumes) {
+        if (volume == nullptr || volume->object_idx() != object_index || volume->volume_idx() != volume_index)
+            continue;
+        volume->image_map_preview_override_data = preview_data;
+        // Do not let a completed texture generated for a previous settings
+        // snapshot satisfy the next render before its replacement job starts.
+        volume->image_map_source_preview_data.reset();
+        volume->image_map_source_preview_signature = 0;
+    }
+    set_as_dirty();
+}
+
+bool GLCanvas3D::image_map_preview_update_pending() const
+{
+    return m_volumes.source_color_preview_progress().has_value();
+}
+
+void GLCanvas3D::_render_source_color_preview_progress()
+{
+    for (GLVolume* volume : m_volumes.volumes) {
+        if (volume != nullptr)
+            volume->image_map_highlight_filament_id = m_image_map_highlight_filament_id;
+    }
+    const std::optional<float> progress = m_volumes.source_color_preview_progress();
+    if (!progress)
+        return;
+
+    const float  window_width = std::max(320.f, ImGui::GetFontSize() * 22.f);
+    const ImVec2 display_size = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowPos(ImVec2(display_size.x * 0.5f, display_size.y - ImGui::GetFontSize() * 6.f),
+                            ImGuiCond_Always, ImVec2(0.5f, 1.f));
+    ImGui::SetNextWindowSize(ImVec2(window_width, 0.f));
+    ImGui::SetNextWindowBgAlpha(0.97f);
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                                   ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize;
+    if (ImGui::Begin("##source_color_preview_progress", nullptr, flags)) {
+        ImGui::TextUnformatted(_u8L("Computing printable color preview...").c_str());
+        const float       fraction = std::clamp(*progress, 0.f, 1.f);
+        const int         percent  = int(std::lround(fraction * 100.f));
+        const std::string overlay  = std::to_string(percent) + "%";
+        ImGui::ProgressBar(fraction, ImVec2(window_width - ImGui::GetStyle().WindowPadding.x * 2.f, 0.f), overlay.c_str());
+    }
+    ImGui::End();
+
+    // Keep polling the worker without making the normal idle loop render at full speed.
+    // When the preview is ready, this extra frame uploads it and shows the colours.
+    schedule_extra_frame(50);
+}
 
 void GLCanvas3D::schedule_extra_frame(int miliseconds)
 {

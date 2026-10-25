@@ -3187,6 +3187,23 @@ size_t GLVolumeCollection::gpu_memory_used() const
 	return memsize;
 }
 
+// Prusa Colorin (Orca FullSpectrum 0.9.18, V3): mean progress of the image-map colour previews still being prepared.
+std::optional<float> GLVolumeCollection::source_color_preview_progress() const
+{
+    float  progress_sum  = 0.f;
+    size_t pending_count = 0;
+    for (const GLVolume* volume : volumes) {
+        if (volume == nullptr)
+            continue;
+        const std::optional<float> progress = volume->source_color_preview_progress();
+        if (!progress)
+            continue;
+        progress_sum += *progress;
+        ++pending_count;
+    }
+    return pending_count == 0 ? std::nullopt : std::optional<float>(progress_sum / float(pending_count));
+}
+
 std::string GLVolumeCollection::log_memory_info() const 
 { 
 	return " (GLVolumeCollection RAM: " + format_memsize_MB(this->cpu_memory_used()) + " GPU: " + format_memsize_MB(this->gpu_memory_used()) + " Both: " + format_memsize_MB(this->gpu_memory_used()) + ")";

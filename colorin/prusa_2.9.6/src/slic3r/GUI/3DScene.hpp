@@ -533,6 +533,8 @@ public:
     size_t 				total_memory_used() const { return this->cpu_memory_used() + this->gpu_memory_used(); }
     // Return CPU, GPU and total memory log line.
     std::string         log_memory_info() const;
+    // Prusa Colorin (Orca 0.9.18, V3): progress of pending image-map colour previews.
+    std::optional<float> source_color_preview_progress() const;
 
 private:
     GLVolumeCollection(const GLVolumeCollection &other);
