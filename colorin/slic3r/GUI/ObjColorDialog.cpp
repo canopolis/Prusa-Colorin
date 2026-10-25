@@ -54,22 +54,21 @@ const int COLOR_LABEL_WIDTH = 140;
 #define ICON_SIZE                 wxSize(FromDIP(16), FromDIP(16))
 #define MIN_OBJCOLOR_DIALOG_WIDTH FromDIP(560)
 
-// Prusa Colorin: ventana con desplazamiento vertical. Si el contenido es mas alto que la pantalla,
-// la ventana se limita a ~85% del alto disponible y aparece una barra de desplazamiento.
+// Prusa Colorin: la ventana se muestra al 80% del tamano original de su contenido (ancho y alto);
+// lo que no cabe se ve con las barras de desplazamiento.
 class ColorinCappedScroll : public wxScrolledWindow
 {
 public:
-    int cap_h { 0 };
-    explicit ColorinCappedScroll(wxWindow *parent) : wxScrolledWindow(parent, wxID_ANY) { SetScrollRate(0, 10); }
+    static constexpr double SCALE = 0.8;
+    explicit ColorinCappedScroll(wxWindow *parent) : wxScrolledWindow(parent, wxID_ANY) { SetScrollRate(10, 10); }
 protected:
     wxSize DoGetBestSize() const override
     {
-        wxSize s = wxScrolledWindow::DoGetBestSize();
-        if (cap_h > 0 && s.y > cap_h) {
-            s.y = cap_h;
-            s.x += wxSystemSettings::GetMetric(wxSYS_VSCROLL_X);
-        }
-        return s;
+        wxSize content(0, 0);
+        if (wxSizer *sizer = GetSizer())
+            content = sizer->GetMinSize();
+        const int sb = wxSystemSettings::GetMetric(wxSYS_VSCROLL_X);
+        return wxSize(int(content.x * SCALE) + sb, int(content.y * SCALE) + sb);
     }
 };
 
@@ -515,11 +514,6 @@ ObjColorDialog::ObjColorDialog(wxWindow*                       parent,
     // Prusa Colorin: el panel va dentro de una ventana con desplazamiento para que quepa en la pantalla.
     auto* colorin_scroll = new ColorinCappedScroll(this);
     colorin_scroll->SetBackgroundColour(MFDTheme::dialog_background());
-    {
-        const int display_idx = wxDisplay::GetFromWindow(parent ? parent : static_cast<wxWindow*>(wxGetApp().mainframe));
-        wxDisplay display(display_idx == wxNOT_FOUND ? 0u : unsigned(display_idx));
-        colorin_scroll->cap_h = int(display.GetClientArea().GetHeight() * 0.85) - FromDIP(90);
-    }
     m_panel_ObjColor = new ObjColorPanel(colorin_scroll, input_colors, is_single_color, import_context,
                                          extruder_colours, filament_ids, first_extruder_id,
                                          obj_filename);
