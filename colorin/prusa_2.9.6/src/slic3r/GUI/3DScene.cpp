@@ -2143,7 +2143,7 @@ bool GLVolume::render_image_map_source_preview(const Transform3d& view_matrix, c
         const std::shared_ptr<const ImageMap::VolumeData> image_map_data = image_map_preview_override_data ?
                                                                                image_map_preview_override_data :
                                                                                model_volume->image_map_data();
-        if (model_volume->mmu_segmentation_facets.empty() && (!image_map_data || image_map_data->empty()))
+        if (model_volume->mm_segmentation_facets.empty() && (!image_map_data || image_map_data->empty()))
             break;
 
         std::optional<ImageMap::RenderMode> image_map_render_mode;
