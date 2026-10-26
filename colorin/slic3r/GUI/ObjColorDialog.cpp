@@ -54,12 +54,12 @@ const int COLOR_LABEL_WIDTH = 140;
 #define ICON_SIZE                 wxSize(FromDIP(16), FromDIP(16))
 #define MIN_OBJCOLOR_DIALOG_WIDTH FromDIP(560)
 
-// Prusa Colorin: la ventana se muestra al 70% del tamano original de su contenido (ancho y alto);
+// Prusa Colorin: la ventana se muestra al 65% del tamano original de su contenido (ancho y alto);
 // lo que no cabe se ve con las barras de desplazamiento.
 class ColorinCappedScroll : public wxScrolledWindow
 {
 public:
-    static constexpr double SCALE = 0.7;
+    static constexpr double SCALE = 0.65;
     explicit ColorinCappedScroll(wxWindow *parent) : wxScrolledWindow(parent, wxID_ANY) { SetScrollRate(10, 10); }
 protected:
     wxSize DoGetBestSize() const override
