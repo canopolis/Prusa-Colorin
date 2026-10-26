@@ -1064,6 +1064,13 @@ static bool apply_mixed_region_surface_offsets(PrintObject &print_object)
                                << " changed_regions=" << changed_regions
                                << " contracted_regions=" << contracted_regions
 
+                               << " expanded_regions=" << expanded_regions
+                               << " stolen_regions=" << stolen_regions;
+    return true;
+}
+
+// ---- end Prusa Colorin S3 ----
+
 // ---- Prusa Colorin S4: surface emboss mixed (Orca FullSpectrum v0.9.18 PrintObjectSlice.cpp 4978-5382) ----
 static float emboss_surface_mixed_shell_override_delta(const LayerRegion &layerm, const ModelVolume &volume);
 
@@ -2648,12 +2655,6 @@ static LocalZActivePair derive_local_z_active_pair(const MixedFilamentDefinition
 }
 
 // ---- end Prusa Colorin Local-Z parte 1 ----
-                               << " expanded_regions=" << expanded_regions
-                               << " stolen_regions=" << stolen_regions;
-    return true;
-}
-
-// ---- end Prusa Colorin S3 ----
 
 
 static void colorin_resolve_mixed_channels(const PrintObject &print_object, std::vector<std::vector<ExPolygons>> &segmentation)
