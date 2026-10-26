@@ -3,6 +3,9 @@
 ///|/ PrusaSlicer is released under the terms of the AGPLv3 or higher
 ///|/
 #include <boost/log/trivial.hpp>
+#include <fstream>
+#include "SVG.hpp"
+#include "Utils.hpp"
 #include <numeric>
 #include <oneapi/tbb/blocked_range.h>
 #include <oneapi/tbb/parallel_for.h>
@@ -47,6 +50,11 @@
 
 
 namespace Slic3r {
+
+// Prusa Colorin S4 forward declarations (defined in the S4 block below).
+static bool has_surface_emboss_mixed_volume(const PrintObject &print_object);
+static std::string surface_emboss_mixed_debug_file_path(const PrintObject &print_object);
+static void reset_surface_emboss_mixed_debug_file(const PrintObject &print_object);
 
 LayerPtrs new_layers(
     PrintObject                 *print_object,
@@ -539,6 +547,12 @@ void PrintObject::slice()
     m_typed_slices = false;
     this->clear_layers();
     m_layers = new_layers(this, generate_object_layers(m_slicing_params, layer_height_profile));
+    if (has_surface_emboss_mixed_volume(*this)) {
+        reset_surface_emboss_mixed_debug_file(*this);
+        BOOST_LOG_TRIVIAL(warning) << "Surface emboss mixed debug enabled"
+                                   << " object=" << (this->model_object() ? this->model_object()->name : std::string("<unknown>"))
+                                   << " debug_file=" << surface_emboss_mixed_debug_file_path(*this);
+    }
     this->slice_volumes();
     m_print->throw_if_canceled();
 #if 0
@@ -1049,6 +1063,415 @@ static bool apply_mixed_region_surface_offsets(PrintObject &print_object)
                                << " changed_layers=" << changed_layers
                                << " changed_regions=" << changed_regions
                                << " contracted_regions=" << contracted_regions
+
+// ---- Prusa Colorin S4: surface emboss mixed (Orca FullSpectrum v0.9.18 PrintObjectSlice.cpp 4978-5382) ----
+static float emboss_surface_mixed_shell_override_delta(const LayerRegion &layerm, const ModelVolume &volume);
+
+struct SurfaceEmbossMixedDebugCandidate
+{
+    const ModelVolume *volume { nullptr };
+    int                region_id { -1 };
+};
+
+static bool has_surface_emboss_mixed_volume(const PrintObject &print_object)
+{
+    const Print *print = print_object.print();
+    if (print == nullptr)
+        return false;
+
+    const size_t                num_physical = print->config().filament_diameter.size();
+    const MixedFilamentManager &mixed_mgr    = print->mixed_filament_manager();
+    for (const ModelVolume *volume : print_object.model_object()->volumes)
+        if (volume->is_model_part() &&
+            volume->emboss_shape.has_value() &&
+            volume->emboss_shape->projection.use_surface &&
+            mixed_mgr.is_mixed(unsigned(std::max(0, volume->extruder_id())), num_physical))
+            return true;
+    return false;
+}
+
+static std::string surface_emboss_mixed_debug_file_path(const PrintObject &print_object)
+{
+    return debug_out_path("emboss-mixed/obj-%d-debug.txt", int(print_object.id().id));
+}
+
+static void reset_surface_emboss_mixed_debug_file(const PrintObject &print_object)
+{
+    std::ofstream out(surface_emboss_mixed_debug_file_path(print_object), std::ios::out | std::ios::trunc);
+    out << "surface emboss mixed debug"
+        << " object_id=" << int(print_object.id().id)
+        << " object_name=" << (print_object.model_object() ? print_object.model_object()->name : std::string("<unknown>"))
+        << "\n";
+}
+
+static void append_surface_emboss_mixed_debug_line(const PrintObject &print_object, const std::string &line)
+{
+    std::ofstream out(surface_emboss_mixed_debug_file_path(print_object), std::ios::out | std::ios::app);
+    out << line << '\n';
+}
+
+static std::vector<SurfaceEmbossMixedDebugCandidate> collect_surface_emboss_mixed_debug_candidates(
+    const Layer                                  &layer,
+    const PrintObjectRegions::LayerRangeRegions  &layer_range,
+    const MixedFilamentManager                   &mixed_mgr,
+    size_t                                        num_physical)
+{
+    std::vector<SurfaceEmbossMixedDebugCandidate> out;
+    std::vector<int>                              processed_region_ids;
+    processed_region_ids.reserve(layer_range.volume_regions.size());
+
+    for (const PrintObjectRegions::VolumeRegion &volume_region : layer_range.volume_regions) {
+        const ModelVolume *volume = volume_region.model_volume;
+        if (volume == nullptr || !volume->is_model_part() || !volume->emboss_shape.has_value() || !volume->emboss_shape->projection.use_surface)
+            continue;
+        if (volume_region.region == nullptr)
+            continue;
+
+        const int region_id = volume_region.region->print_object_region_id();
+        if (region_id < 0 || region_id >= layer.region_count())
+            continue;
+        if (std::find(processed_region_ids.begin(), processed_region_ids.end(), region_id) != processed_region_ids.end())
+            continue;
+        processed_region_ids.emplace_back(region_id);
+
+        if (!mixed_mgr.is_mixed(unsigned(std::max(0, volume_region.region->config().perimeter_extruder.value)), num_physical))
+            continue;
+
+        out.push_back({ volume, region_id });
+    }
+
+    return out;
+}
+
+static void export_surface_emboss_mixed_layer_svg(
+    const char                                          *stage,
+    const PrintObject                                   &print_object,
+    size_t                                               layer_id,
+    const Layer                                         &layer,
+    const std::vector<SurfaceEmbossMixedDebugCandidate> &candidates,
+    const ExPolygons                                    *overlay,
+    const std::string                                   &overlay_legend)
+{
+    std::vector<std::pair<ExPolygons, SVG::ExPolygonAttributes>> items;
+    items.reserve(size_t(layer.region_count()) + ((overlay != nullptr && !overlay->empty()) ? 1 : 0));
+
+    for (int region_id = 0; region_id < layer.region_count(); ++region_id) {
+        const LayerRegion *layerm = layer.get_region(region_id);
+        if (layerm == nullptr || layerm->slices().empty())
+            continue;
+
+        ExPolygons expolygons = to_expolygons(layerm->slices().surfaces);
+        if (expolygons.empty())
+            continue;
+
+        const bool is_candidate = std::find_if(candidates.begin(), candidates.end(), [region_id](const auto &candidate) {
+            return candidate.region_id == region_id;
+        }) != candidates.end();
+
+        SVG::ExPolygonAttributes attrs(
+            "region " + std::to_string(region_id) + " wall=" + std::to_string(layerm->region().config().perimeter_extruder.value),
+            is_candidate ? "#3b82f6" : "#bfc5cc",
+            is_candidate ? 0.35f : 0.14f);
+        attrs.outline_width = scale_(0.05f);
+        attrs.color_contour = is_candidate ? "blue" : "black";
+        attrs.color_holes   = attrs.color_contour;
+        items.emplace_back(std::move(expolygons), std::move(attrs));
+    }
+
+    if (overlay != nullptr && !overlay->empty()) {
+        SVG::ExPolygonAttributes attrs(overlay_legend, "#ef4444", 0.28f);
+        attrs.outline_width = scale_(0.05f);
+        attrs.color_contour = "red";
+        attrs.color_holes   = "red";
+        items.emplace_back(*overlay, std::move(attrs));
+    }
+
+    if (!items.empty())
+        SVG::export_expolygons(debug_out_path("emboss-mixed/obj-%d-layer-%03d-%s.svg",
+                                              int(print_object.id().id),
+                                              int(layer_id),
+                                              stage),
+                               items);
+}
+
+static void dump_surface_emboss_mixed_layer_state(
+    const char                                          *stage,
+    const PrintObject                                   &print_object,
+    size_t                                               layer_id,
+    const Layer                                         &layer,
+    const PrintObjectRegions::LayerRangeRegions         &layer_range,
+    const std::vector<ExPolygons>                       *segmentation_layer = nullptr)
+{
+    const Print *print = print_object.print();
+    if (print == nullptr)
+        return;
+
+    const size_t                num_physical = print->config().filament_diameter.size();
+    const MixedFilamentManager &mixed_mgr    = print->mixed_filament_manager();
+    const std::vector<SurfaceEmbossMixedDebugCandidate> candidates =
+        collect_surface_emboss_mixed_debug_candidates(layer, layer_range, mixed_mgr, num_physical);
+    if (candidates.empty())
+        return;
+
+    std::ostringstream header;
+    header << std::fixed << std::setprecision(4)
+           << "stage=" << stage
+           << " layer=" << layer_id
+           << " print_z=" << layer.print_z
+           << " slice_z=" << layer.slice_z
+           << " regions=" << layer.region_count()
+           << " candidates=" << candidates.size();
+    append_surface_emboss_mixed_debug_line(print_object, header.str());
+
+    for (int region_id = 0; region_id < layer.region_count(); ++region_id) {
+        const LayerRegion *layerm = layer.get_region(region_id);
+        if (layerm == nullptr)
+            continue;
+        const double slice_area = layerm->slices().empty() ? 0.0 : std::abs(area(to_expolygons(layerm->slices().surfaces)));
+        std::ostringstream line;
+        line << std::fixed << std::setprecision(4)
+             << "  region=" << region_id
+             << " wall=" << layerm->region().config().perimeter_extruder.value
+             << " sparse=" << layerm->region().config().infill_extruder.value
+             << " solid=" << layerm->region().config().solid_infill_extruder.value
+             << " area=" << slice_area;
+        append_surface_emboss_mixed_debug_line(print_object, line.str());
+    }
+
+    for (const SurfaceEmbossMixedDebugCandidate &candidate : candidates) {
+        const LayerRegion *layerm = layer.get_region(candidate.region_id);
+        if (layerm == nullptr)
+            continue;
+
+        const double slice_area = layerm->slices().empty() ? 0.0 : std::abs(area(to_expolygons(layerm->slices().surfaces)));
+        const float  shell_delta_scaled = emboss_surface_mixed_shell_override_delta(*layerm, *candidate.volume);
+        std::ostringstream line;
+        line << std::fixed << std::setprecision(4)
+             << "  candidate region=" << candidate.region_id
+             << " volume_name=" << candidate.volume->name
+             << " volume_extruder=" << candidate.volume->extruder_id()
+             << " cfg_wall=" << layerm->region().config().perimeter_extruder.value
+             << " depth=" << float(candidate.volume->emboss_shape->projection.depth)
+             << " shell_delta_mm=" << unscale<double>(shell_delta_scaled)
+             << " area=" << slice_area;
+        append_surface_emboss_mixed_debug_line(print_object, line.str());
+
+        if (segmentation_layer != nullptr) {
+            const int cfg_wall = layerm->region().config().perimeter_extruder.value;
+            if (cfg_wall >= 1 && cfg_wall <= int(segmentation_layer->size())) {
+                const double seg_area = std::abs(area((*segmentation_layer)[size_t(cfg_wall - 1)]));
+                std::ostringstream seg_line;
+                seg_line << std::fixed << std::setprecision(4)
+                         << "    segmentation channel=" << cfg_wall
+                         << " area=" << seg_area;
+                append_surface_emboss_mixed_debug_line(print_object, seg_line.str());
+            }
+        }
+    }
+
+    export_surface_emboss_mixed_layer_svg(stage, print_object, layer_id, layer, candidates, nullptr, "");
+}
+
+static float emboss_surface_mixed_shell_override_delta(const LayerRegion &layerm, const ModelVolume &volume)
+{
+    if (!volume.emboss_shape.has_value() || !volume.emboss_shape->projection.use_surface)
+        return 0.f;
+
+    const float depth_mm = std::max(0.f, float(volume.emboss_shape->projection.depth));
+    if (depth_mm <= EPSILON)
+        return 0.f;
+
+    const PrintRegionConfig &config = layerm.region().config();
+    if (config.perimeters.value <= 0)
+        return 0.f;
+
+    const Flow   ext_flow        = layerm.flow(frExternalPerimeter);
+    const Flow   perimeter_flow  = layerm.flow(frPerimeter);
+    const coord_t shell_scaled   = ext_flow.scaled_width() / 2 +
+                                   ext_flow.scaled_spacing() / 2 +
+                                   std::max(0, config.perimeters.value - 1) * perimeter_flow.scaled_spacing();
+    const float  shell_depth_mm  = float(unscale<double>(shell_scaled));
+    const float  delta_mm        = std::max(0.f, shell_depth_mm - depth_mm);
+    return delta_mm <= EPSILON ? 0.f : scaled<float>(delta_mm);
+}
+
+template<typename ThrowOnCancel>
+static bool apply_surface_emboss_mixed_region_override(PrintObject &print_object, ThrowOnCancel throw_on_cancel)
+{
+    const Print *print = print_object.print();
+    if (print == nullptr || print_object.layer_count() == 0 || print_object.shared_regions() == nullptr)
+        return false;
+
+    const size_t                 num_physical = print->config().filament_diameter.size();
+    const MixedFilamentManager  &mixed_mgr    = print->mixed_filament_manager();
+    const auto                  &volumes      = print_object.model_object()->volumes;
+    if (num_physical == 0 ||
+        std::find_if(volumes.begin(), volumes.end(), [&mixed_mgr, num_physical](const ModelVolume *volume) {
+            return volume->is_model_part() &&
+                   volume->emboss_shape.has_value() &&
+                   volume->emboss_shape->projection.use_surface &&
+                   mixed_mgr.is_mixed(unsigned(std::max(0, volume->extruder_id())), num_physical);
+        }) == volumes.end())
+        return false;
+
+    const auto &layer_ranges = print_object.shared_regions()->layer_ranges;
+    auto        it_layer_range = layer_range_first(layer_ranges, print_object.get_layer(0)->slice_z);
+
+    size_t changed_layers  = 0;
+    size_t changed_regions = 0;
+    size_t stolen_regions  = 0;
+
+    for (size_t layer_id = 0; layer_id < print_object.layer_count(); ++layer_id) {
+        throw_on_cancel();
+
+        Layer &layer = *print_object.get_layer(int(layer_id));
+        it_layer_range = layer_range_next(layer_ranges, it_layer_range, layer.slice_z);
+        const PrintObjectRegions::LayerRangeRegions &layer_range = *it_layer_range;
+        const std::vector<SurfaceEmbossMixedDebugCandidate> candidates =
+            collect_surface_emboss_mixed_debug_candidates(layer, layer_range, mixed_mgr, num_physical);
+        if (!candidates.empty())
+            dump_surface_emboss_mixed_layer_state("pre-emboss-override", print_object, layer_id, layer, layer_range);
+
+        bool              layer_changed = false;
+        ExPolygons        layer_masks;
+        std::vector<int>  processed_region_ids;
+        processed_region_ids.reserve(layer_range.volume_regions.size());
+
+        for (const PrintObjectRegions::VolumeRegion &volume_region : layer_range.volume_regions) {
+            const ModelVolume *volume = volume_region.model_volume;
+            if (volume == nullptr || !volume->is_model_part() || !volume->emboss_shape.has_value() || !volume->emboss_shape->projection.use_surface)
+                continue;
+            if (volume_region.region == nullptr)
+                continue;
+
+            const int region_id = volume_region.region->print_object_region_id();
+            if (region_id < 0 || region_id >= layer.region_count())
+                continue;
+            if (std::find(processed_region_ids.begin(), processed_region_ids.end(), region_id) != processed_region_ids.end())
+                continue;
+            processed_region_ids.emplace_back(region_id);
+
+            const unsigned int filament_id = unsigned(std::max(0, volume_region.region->config().perimeter_extruder.value));
+            if (!mixed_mgr.is_mixed(filament_id, num_physical))
+                continue;
+
+            LayerRegion *emboss_layerm = layer.get_region(region_id);
+            if (emboss_layerm == nullptr || emboss_layerm->slices().empty())
+                continue;
+
+            ExPolygons override_mask = to_expolygons(emboss_layerm->slices().surfaces);
+            if (override_mask.empty())
+                continue;
+
+            if (const float delta_scaled = emboss_surface_mixed_shell_override_delta(*emboss_layerm, *volume);
+                delta_scaled > float(EPSILON)) {
+                override_mask = offset_ex(override_mask, delta_scaled);
+                if (override_mask.empty())
+                    continue;
+                if (layer_masks.empty())
+                    layer_masks = collect_layer_region_slices(layer);
+                if (!layer_masks.empty())
+                    override_mask = intersection_ex(override_mask, layer_masks);
+                if (override_mask.empty())
+                    continue;
+            }
+
+            {
+                std::ostringstream line;
+                line << std::fixed << std::setprecision(4)
+                     << "stage=override-mask"
+                     << " layer=" << layer_id
+                     << " region=" << region_id
+                     << " volume_name=" << volume->name
+                     << " volume_extruder=" << volume->extruder_id()
+                     << " cfg_wall=" << volume_region.region->config().perimeter_extruder.value
+                     << " depth=" << float(volume->emboss_shape->projection.depth)
+                     << " shell_delta_mm=" << unscale<double>(emboss_surface_mixed_shell_override_delta(*emboss_layerm, *volume))
+                     << " mask_area=" << std::abs(area(override_mask));
+                append_surface_emboss_mixed_debug_line(print_object, line.str());
+            }
+            const std::string overlay_stage = "override-mask-r" + std::to_string(region_id);
+            export_surface_emboss_mixed_layer_svg(overlay_stage.c_str(),
+                                                  print_object,
+                                                  layer_id,
+                                                  layer,
+                                                  candidates,
+                                                  &override_mask,
+                                                  "override mask");
+
+            ExPolygons emboss_slices = to_expolygons(emboss_layerm->slices().surfaces);
+            bool       emboss_changed = false;
+
+            for (int target_region_id = 0; target_region_id < layer.region_count(); ++target_region_id) {
+                if (target_region_id == region_id)
+                    continue;
+
+                LayerRegion *target_layerm = layer.get_region(target_region_id);
+                if (target_layerm == nullptr || target_layerm->slices().empty())
+                    continue;
+                if (target_layerm->region().config().perimeter_extruder.value == int(filament_id))
+                    continue;
+
+                ExPolygons stolen = intersection_ex(target_layerm->slices().surfaces, override_mask);
+                if (stolen.empty())
+                    continue;
+
+                append(emboss_slices, stolen);
+                emboss_changed = true;
+                ++stolen_regions;
+
+                std::ostringstream line;
+                line << std::fixed << std::setprecision(4)
+                     << "stage=override-steal"
+                     << " layer=" << layer_id
+                     << " emboss_region=" << region_id
+                     << " from_region=" << target_region_id
+                     << " from_wall=" << target_layerm->region().config().perimeter_extruder.value
+                     << " stolen_area=" << std::abs(area(stolen));
+                append_surface_emboss_mixed_debug_line(print_object, line.str());
+
+                Polygons remaining = diff(to_polygons(target_layerm->slices().surfaces), override_mask);
+                if (!remaining.empty())
+                    remaining = opening(union_ex(remaining), scaled<float>(5. * EPSILON), scaled<float>(5. * EPSILON));
+                const_cast<SurfaceCollection&>(target_layerm->slices()).set(union_ex(remaining), stInternal);
+                layer_changed = true;
+            }
+
+            if (emboss_changed) {
+                if (emboss_slices.size() > 1)
+                    emboss_slices = closing_ex(to_polygons(emboss_slices), scaled<float>(10. * EPSILON));
+                const_cast<SurfaceCollection&>(emboss_layerm->slices()).set(std::move(emboss_slices), stInternal);
+                ++changed_regions;
+                layer_changed = true;
+            } else {
+                std::ostringstream line;
+                line << "stage=override-no-steal"
+                     << " layer=" << layer_id
+                     << " region=" << region_id
+                     << " volume_name=" << volume->name;
+                append_surface_emboss_mixed_debug_line(print_object, line.str());
+            }
+        }
+
+        if (!candidates.empty())
+            dump_surface_emboss_mixed_layer_state("post-emboss-override", print_object, layer_id, layer, layer_range);
+
+        if (layer_changed)
+            ++changed_layers;
+    }
+
+    if (changed_regions == 0)
+        return false;
+
+    BOOST_LOG_TRIVIAL(warning) << "Surface emboss mixed-region override applied"
+                               << " object=" << (print_object.model_object() ? print_object.model_object()->name : std::string("<unknown>"))
+                               << " changed_layers=" << changed_layers
+                               << " changed_regions=" << changed_regions
+                               << " stolen_regions=" << stolen_regions;
+    return true;
+}
+
+// ---- end Prusa Colorin S4 ----
                                << " expanded_regions=" << expanded_regions
                                << " stolen_regions=" << stolen_regions;
     return true;
@@ -1485,6 +1908,9 @@ void PrintObject::slice_volumes()
         BOOST_LOG_TRIVIAL(debug) << "Slicing volumes - Fuzzy skin segmentation";
         apply_fuzzy_skin_segmentation(*this, [print]() { print->throw_if_canceled(); });
     }
+
+    // Prusa Colorin S4 (Orca 0.9.18): surface emboss with mixed filament region override.
+    apply_surface_emboss_mixed_region_override(*this, [print]() { print->throw_if_canceled(); });
 
     if (!m_print->virtual_extruders().empty()) {
         FullSpectrum::remap_virtual_region_slices_to_physical(
