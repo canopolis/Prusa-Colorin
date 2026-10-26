@@ -1472,6 +1472,1182 @@ static bool apply_surface_emboss_mixed_region_override(PrintObject &print_object
 }
 
 // ---- end Prusa Colorin S4 ----
+
+// ---- Prusa Colorin Local-Z parte 1: alturas de subcapa y pares activos (Orca FullSpectrum v0.9.18 PrintObjectSlice.cpp 1212-2315) ----
+// Copia de ImageMap::allocate_adaptive_local_z_heights (Orca 0.9.18 ImageMap/AdaptiveLocalZRenderer.cpp 21-86) hasta portar el renderer.
+static constexpr double COLORIN_ADAPTIVE_LOCAL_Z_MAX_HEIGHT_MM = 0.32;
+static std::vector<double> colorin_allocate_adaptive_local_z_heights(const std::vector<double>& weights,
+                                                      double                     total_height,
+                                                      double                     configured_minimum)
+{
+    std::vector<double> heights(weights.size(), 0.0);
+    if (weights.empty() || total_height <= EPSILON)
+        return heights;
+
+    // A valid print profile keeps the nominal layer height below this ceiling,
+    // so an N-pass cadence always has enough total capacity. Preserve the
+    // model envelope for a malformed profile instead of silently losing Z.
+    const double maximum = std::max(COLORIN_ADAPTIVE_LOCAL_Z_MAX_HEIGHT_MM, total_height / double(weights.size()));
+    const double minimum = std::min(maximum, std::max(0.01, configured_minimum));
+    const double effective_minimum = minimum * double(weights.size()) <= total_height + EPSILON
+        ? minimum
+        : total_height / double(weights.size());
+
+    const double total_weight = std::accumulate(weights.begin(), weights.end(), 0.0, [](double sum, double weight) {
+        return sum + std::max(0.0, weight);
+    });
+    for (size_t component_idx = 0; component_idx < weights.size(); ++component_idx) {
+        const double desired = total_weight > EPSILON
+            ? total_height * std::max(0.0, weights[component_idx]) / total_weight
+            : total_height / double(weights.size());
+        heights[component_idx] = std::clamp(desired, effective_minimum, maximum);
+    }
+
+    // Clamping one component changes the height still available to its
+    // siblings. Redistribute that difference without changing the fixed cycle
+    // top; zero-weight siblings share unavoidable excess equally.
+    for (int pass = 0; pass < 2 * int(weights.size()) + 2; ++pass) {
+        const double assigned = std::accumulate(heights.begin(), heights.end(), 0.0);
+        const double delta    = total_height - assigned;
+        if (std::abs(delta) <= 1e-10)
+            break;
+
+        const bool increase = delta > 0.0;
+        std::vector<size_t> candidates;
+        double              candidate_weight = 0.0;
+        for (size_t component_idx = 0; component_idx < heights.size(); ++component_idx) {
+            const double capacity = increase ? maximum - heights[component_idx]
+                                             : heights[component_idx] - effective_minimum;
+            if (capacity <= EPSILON)
+                continue;
+            candidates.emplace_back(component_idx);
+            candidate_weight += std::max(0.0, weights[component_idx]);
+        }
+        if (candidates.empty())
+            break;
+
+        double applied = 0.0;
+        for (size_t component_idx : candidates) {
+            const double share = candidate_weight > EPSILON
+                ? std::max(0.0, weights[component_idx]) / candidate_weight
+                : 1.0 / double(candidates.size());
+            const double capacity = increase ? maximum - heights[component_idx]
+                                             : heights[component_idx] - effective_minimum;
+            const double adjustment = std::min(std::abs(delta) * share, capacity);
+            heights[component_idx] += increase ? adjustment : -adjustment;
+            applied += adjustment;
+        }
+        if (applied <= 1e-10)
+            break;
+    }
+    return heights;
+}
+
+static bool fit_pass_heights_to_interval(std::vector<double> &passes, double base_height, double lo, double hi)
+{
+    if (passes.empty() || base_height <= EPSILON)
+        return false;
+
+    double sum = std::accumulate(passes.begin(), passes.end(), 0.0);
+    double delta = base_height - sum;
+
+    auto within = [lo, hi](double h) { return h >= lo - EPSILON && h <= hi + EPSILON; };
+    if (std::abs(delta) > EPSILON) {
+        if (within(passes.back() + delta)) {
+            passes.back() += delta;
+            delta = 0.0;
+        } else if (delta > 0.0) {
+            for (size_t i = passes.size(); i > 0 && delta > EPSILON; --i) {
+                double &h = passes[i - 1];
+                const double room = hi - h;
+                if (room <= EPSILON)
+                    continue;
+                const double take = std::min(room, delta);
+                h += take;
+                delta -= take;
+            }
+        } else {
+            for (size_t i = passes.size(); i > 0 && delta < -EPSILON; --i) {
+                double &h = passes[i - 1];
+                const double room = h - lo;
+                if (room <= EPSILON)
+                    continue;
+                const double take = std::min(room, -delta);
+                h -= take;
+                delta += take;
+            }
+        }
+    }
+
+    if (std::abs(delta) > 1e-6)
+        return false;
+    return std::all_of(passes.begin(), passes.end(), within);
+}
+
+static bool sanitize_local_z_pass_heights(std::vector<double> &passes, double base_height, double min_sublayer_height)
+{
+    if (passes.empty() || base_height <= EPSILON)
+        return false;
+
+    const double lo = std::max<double>(0.01, min_sublayer_height);
+    const double hi = std::max<double>(lo, base_height);
+    for (double &h : passes) {
+        if (!std::isfinite(h))
+            h = lo;
+        h = std::clamp(h, lo, hi);
+    }
+    return fit_pass_heights_to_interval(passes, base_height, lo, hi);
+}
+
+static std::vector<double> build_uniform_local_z_pass_heights(double base_height,
+                                                              double min_sublayer_height,
+                                                              size_t max_passes_limit = 0)
+{
+    std::vector<double> out;
+    if (base_height <= EPSILON)
+        return out;
+
+    const double lo = std::max<double>(0.01, min_sublayer_height);
+    const double hi = std::max<double>(lo, base_height);
+    size_t min_passes = size_t(std::max<double>(1.0, std::ceil((base_height - EPSILON) / hi)));
+    size_t max_passes = size_t(std::max<double>(1.0, std::floor((base_height + EPSILON) / lo)));
+    size_t pass_count = min_passes;
+
+    if (max_passes >= min_passes) {
+        const double target_step = 0.5 * (lo + hi);
+        const size_t target_passes =
+            size_t(std::max<double>(1.0, std::llround(base_height / std::max<double>(target_step, EPSILON))));
+        pass_count = std::clamp(target_passes, min_passes, max_passes);
+    }
+
+    if (max_passes_limit > 0) {
+        const size_t capped_limit = std::max<size_t>(1, max_passes_limit);
+        if (pass_count > capped_limit)
+            pass_count = capped_limit;
+    }
+
+    if (pass_count == 1 && base_height >= 2.0 * lo - EPSILON && max_passes >= 2)
+        pass_count = 2;
+
+    if (pass_count <= 1) {
+        out.emplace_back(base_height);
+        return out;
+    }
+
+    const double uniform_height = base_height / double(pass_count);
+    out.assign(pass_count, uniform_height);
+
+    // Keep the accumulated numeric error at the very top of the interval.
+    double accumulated = 0.0;
+    for (size_t i = 0; i + 1 < out.size(); ++i)
+        accumulated += out[i];
+    out.back() = std::max<double>(EPSILON, base_height - accumulated);
+    return out;
+}
+
+static std::vector<double> build_uniform_local_z_pass_heights_exact(double base_height,
+                                                                    double min_sublayer_height,
+                                                                    size_t pass_count)
+{
+    if (base_height <= EPSILON || pass_count == 0)
+        return {};
+
+    const double lo = std::max<double>(0.01, min_sublayer_height);
+    const double hi = std::max<double>(lo, base_height);
+    if (pass_count == 1)
+        return { base_height };
+
+    if (double(pass_count) * lo > base_height + EPSILON || double(pass_count) * hi < base_height - EPSILON)
+        return {};
+
+    std::vector<double> out(pass_count, base_height / double(pass_count));
+    if (!fit_pass_heights_to_interval(out, base_height, lo, hi))
+        return {};
+    return out;
+}
+
+static inline void compute_local_z_component_heights(int mix_b_percent,
+                                                     double base_height,
+                                                     double min_sublayer_height,
+                                                     double &h_a,
+                                                     double &h_b)
+{
+    const auto heights = mixed_filament_local_z_pair_heights(base_height, min_sublayer_height, mix_b_percent);
+    h_a               = heights.first;
+    h_b               = heights.second;
+}
+
+static bool choose_local_z_start_with_component_a(const std::vector<double> &pass_heights,
+                                                  double                     expected_h_a,
+                                                  double                     expected_h_b,
+                                                  size_t                     cadence_index)
+{
+    double err_ab = 0.0;
+    double err_ba = 0.0;
+    for (size_t pass_i = 0; pass_i < pass_heights.size(); ++pass_i) {
+        const double expected_ab = (pass_i % 2) == 0 ? expected_h_a : expected_h_b;
+        const double expected_ba = (pass_i % 2) == 0 ? expected_h_b : expected_h_a;
+        err_ab += std::abs(pass_heights[pass_i] - expected_ab);
+        err_ba += std::abs(pass_heights[pass_i] - expected_ba);
+    }
+
+    if (err_ab + 1e-6 < err_ba)
+        return true;
+    if (err_ba + 1e-6 < err_ab)
+        return false;
+
+    // When the requested component heights are equal (for example 50/50),
+    // either A/B or B/A is numerically identical. Preserve the existing
+    // row cadence so equal-split layers keep the normal local-Z A/B/A/B
+    // sequence instead of flipping AB|BA between nominal layers.
+    if (std::abs(expected_h_a - expected_h_b) <= 1e-6) {
+        return (cadence_index % 2) == 0;
+    }
+
+    return expected_h_a >= expected_h_b;
+}
+
+static std::vector<double> build_local_z_alternating_pass_heights(double base_height,
+                                                                   double min_sublayer_height,
+                                                                   double gradient_h_a,
+                                                                   double gradient_h_b,
+                                                                   size_t max_passes_limit = 0)
+{
+    if (base_height <= EPSILON)
+        return {};
+
+    const double minimum = std::max<double>(0.01, min_sublayer_height);
+    if (gradient_h_a <= EPSILON || gradient_h_b <= EPSILON ||
+        base_height < 2.0 * minimum - EPSILON ||
+        (max_passes_limit > 0 && max_passes_limit < 2))
+        return { base_height };
+
+    const double cycle_h = std::max<double>(EPSILON, gradient_h_a + gradient_h_b);
+    const double ratio_a = std::clamp(gradient_h_a / cycle_h, 0.0, 1.0);
+    const double height_a = std::clamp(base_height * ratio_a, minimum, base_height - minimum);
+    return {height_a, base_height - height_a};
+}
+
+static std::vector<double> build_local_z_two_pass_heights(double base_height,
+                                                          double min_sublayer_height,
+                                                          double gradient_h_a,
+                                                          double gradient_h_b)
+{
+    if (base_height <= EPSILON)
+        return {};
+
+    const double lo = std::max<double>(0.01, min_sublayer_height);
+    const double hi = std::max<double>(lo, base_height);
+    if (gradient_h_a <= EPSILON || gradient_h_b <= EPSILON || base_height < 2.0 * lo - EPSILON)
+        return { base_height };
+
+    const double cycle_h = std::max<double>(EPSILON, gradient_h_a + gradient_h_b);
+    const double ratio_a = std::clamp(gradient_h_a / cycle_h, 0.0, 1.0);
+
+    const double h_a_min = std::max(lo, base_height - hi);
+    const double h_a_max = std::min(hi, base_height - lo);
+    if (h_a_min > h_a_max + EPSILON)
+        return { base_height };
+
+    const double h_a = std::clamp(base_height * ratio_a, h_a_min, h_a_max);
+    const double h_b = base_height - h_a;
+
+    std::vector<double> out { h_a, h_b };
+    if (!fit_pass_heights_to_interval(out, base_height, lo, hi))
+        return { base_height };
+    return out;
+}
+
+static std::vector<double> build_local_z_shared_pass_heights(double base_height, double min_sublayer_height)
+{
+    if (base_height <= EPSILON)
+        return {};
+
+    const double lo = std::max<double>(0.01, min_sublayer_height);
+    const double hi = std::max<double>(lo, base_height);
+    if (base_height < 2.0 * lo - EPSILON)
+        return { base_height };
+
+    // In shared (dense multi-zone) mode keep a single pair of pass planes for
+    // the whole nominal layer, anchored to the configured minimum height.
+    double h_small = lo;
+    double h_large = base_height - h_small;
+    if (h_large > hi + EPSILON) {
+        h_large = hi;
+        h_small = base_height - h_large;
+    }
+    if (h_small < lo - EPSILON || h_small > hi + EPSILON ||
+        h_large < lo - EPSILON || h_large > hi + EPSILON)
+        return build_uniform_local_z_pass_heights(base_height, lo);
+
+    std::vector<double> out { h_small, h_large };
+    if (!fit_pass_heights_to_interval(out, base_height, lo, hi))
+        return build_uniform_local_z_pass_heights(base_height, lo);
+    if (out.size() == 2 && out[0] > out[1])
+        std::swap(out[0], out[1]);
+    return out;
+}
+
+static std::vector<double> build_local_z_pass_heights(double base_height,
+                                                      double min_sublayer_height,
+                                                      double preferred_a,
+                                                      double preferred_b,
+                                                      size_t max_passes_limit = 0)
+{
+    if (base_height <= EPSILON)
+        return {};
+
+    const double lo = std::max<double>(0.01, min_sublayer_height);
+    const double hi = std::max<double>(lo, base_height);
+
+    std::vector<double> cadence_unit;
+    if (preferred_a > EPSILON)
+        cadence_unit.push_back(std::clamp(preferred_a, lo, hi));
+    if (preferred_b > EPSILON)
+        cadence_unit.push_back(std::clamp(preferred_b, lo, hi));
+
+    if (!cadence_unit.empty()) {
+        std::vector<double> out;
+        out.reserve(size_t(std::ceil(base_height / lo)) + 2);
+
+        double z_used = 0.0;
+        size_t idx = 0;
+        size_t guard = 0;
+        while (z_used + cadence_unit[idx] < base_height - EPSILON && guard++ < 100000) {
+            out.push_back(cadence_unit[idx]);
+            z_used += cadence_unit[idx];
+            idx = (idx + 1) % cadence_unit.size();
+        }
+
+        const double remainder = base_height - z_used;
+        if (remainder > EPSILON)
+            out.push_back(remainder);
+
+        if (fit_pass_heights_to_interval(out, base_height, lo, hi) &&
+            (max_passes_limit == 0 || out.size() <= max_passes_limit))
+            return out;
+
+        if (max_passes_limit > 0 && preferred_a > EPSILON && preferred_b > EPSILON)
+            return build_local_z_alternating_pass_heights(base_height,
+                                                          min_sublayer_height,
+                                                          preferred_a,
+                                                          preferred_b,
+                                                          max_passes_limit);
+    }
+
+    return build_uniform_local_z_pass_heights(base_height, lo, max_passes_limit);
+}
+
+static std::vector<unsigned int> decode_manual_pattern_sequence(const MixedFilamentDefinition &definition, size_t num_physical)
+{
+    return mixed_filament_manual_pattern_sequence(definition, num_physical);
+}
+
+static std::vector<unsigned int> decode_blend_component_ids(const MixedFilamentDefinition &definition, size_t num_physical)
+{
+    return definition.recipe.blend.component_ids(num_physical);
+}
+
+static std::vector<int> decode_blend_component_weights(const MixedFilamentDefinition &definition,
+                                                       size_t                         num_physical,
+                                                       size_t                         expected_components)
+{
+    if (expected_components == 0)
+        return {};
+
+    std::vector<int> out = definition.recipe.blend.component_percents(num_physical);
+    if (out.size() != expected_components)
+        return {};
+
+    int sum = 0;
+    for (const int v : out)
+        sum += std::max(0, v);
+    if (sum <= 0)
+        return {};
+    return out;
+}
+
+static void reduce_weight_counts_to_cycle_limit(std::vector<int> &counts, size_t cycle_limit)
+{
+    if (counts.empty() || cycle_limit == 0)
+        return;
+
+    int total = std::accumulate(counts.begin(), counts.end(), 0);
+    if (total <= 0 || size_t(total) <= cycle_limit)
+        return;
+
+    std::vector<size_t> positive_indices;
+    positive_indices.reserve(counts.size());
+    for (size_t i = 0; i < counts.size(); ++i)
+        if (counts[i] > 0)
+            positive_indices.emplace_back(i);
+
+    if (positive_indices.empty()) {
+        counts.assign(counts.size(), 0);
+        return;
+    }
+
+    std::vector<int> reduced(counts.size(), 0);
+    if (cycle_limit < positive_indices.size()) {
+        std::sort(positive_indices.begin(), positive_indices.end(), [&counts](size_t lhs, size_t rhs) {
+            if (counts[lhs] != counts[rhs])
+                return counts[lhs] > counts[rhs];
+            return lhs < rhs;
+        });
+        for (size_t i = 0; i < cycle_limit; ++i)
+            reduced[positive_indices[i]] = 1;
+        counts = std::move(reduced);
+        return;
+    }
+
+    size_t remaining_slots = cycle_limit;
+    for (const size_t idx : positive_indices) {
+        reduced[idx] = 1;
+        --remaining_slots;
+    }
+
+    int total_extras = 0;
+    std::vector<int> extra_counts(counts.size(), 0);
+    for (const size_t idx : positive_indices) {
+        extra_counts[idx] = std::max(0, counts[idx] - 1);
+        total_extras += extra_counts[idx];
+    }
+    if (remaining_slots == 0 || total_extras <= 0) {
+        counts = std::move(reduced);
+        return;
+    }
+
+    std::vector<double> remainders(counts.size(), -1.0);
+    size_t assigned_slots = 0;
+    for (const size_t idx : positive_indices) {
+        if (extra_counts[idx] == 0)
+            continue;
+        const double exact = double(remaining_slots) * double(extra_counts[idx]) / double(total_extras);
+        const int assigned = int(std::floor(exact));
+        reduced[idx] += assigned;
+        assigned_slots += size_t(assigned);
+        remainders[idx] = exact - double(assigned);
+    }
+
+    size_t missing_slots = remaining_slots > assigned_slots ? (remaining_slots - assigned_slots) : size_t(0);
+    while (missing_slots > 0) {
+        size_t best_idx = size_t(-1);
+        double best_remainder = -1.0;
+        int    best_extra = -1;
+        for (const size_t idx : positive_indices) {
+            if (extra_counts[idx] == 0)
+                continue;
+            if (remainders[idx] > best_remainder ||
+                (std::abs(remainders[idx] - best_remainder) <= 1e-9 && extra_counts[idx] > best_extra) ||
+                (std::abs(remainders[idx] - best_remainder) <= 1e-9 && extra_counts[idx] == best_extra && idx < best_idx)) {
+                best_idx = idx;
+                best_remainder = remainders[idx];
+                best_extra = extra_counts[idx];
+            }
+        }
+        if (best_idx == size_t(-1))
+            break;
+        ++reduced[best_idx];
+        remainders[best_idx] = -1.0;
+        --missing_slots;
+    }
+
+    counts = std::move(reduced);
+}
+
+static std::vector<unsigned int> build_weighted_gradient_sequence(const std::vector<unsigned int> &ids,
+                                                                  const std::vector<int>          &weights,
+                                                                  size_t                           max_cycle_limit = 0)
+{
+    if (ids.empty())
+        return {};
+
+    std::vector<unsigned int> filtered_ids;
+    std::vector<int>          counts;
+    filtered_ids.reserve(ids.size());
+    counts.reserve(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i) {
+        const int w = (i < weights.size()) ? std::max(0, weights[i]) : 0;
+        if (w <= 0)
+            continue;
+        filtered_ids.emplace_back(ids[i]);
+        counts.emplace_back(w);
+    }
+    if (filtered_ids.empty()) {
+        filtered_ids = ids;
+        counts.assign(ids.size(), 1);
+    }
+
+    int g = 0;
+    for (const int c : counts)
+        g = std::gcd(g, std::max(1, c));
+    if (g > 1) {
+        for (int &c : counts)
+            c = std::max(1, c / g);
+    }
+
+    constexpr size_t k_max_cycle = 48;
+    const size_t effective_cycle_limit =
+        max_cycle_limit > 0 ? std::min(k_max_cycle, std::max<size_t>(1, max_cycle_limit)) : k_max_cycle;
+    reduce_weight_counts_to_cycle_limit(counts, effective_cycle_limit);
+
+    std::vector<unsigned int> reduced_ids;
+    std::vector<int>          reduced_counts;
+    reduced_ids.reserve(filtered_ids.size());
+    reduced_counts.reserve(counts.size());
+    for (size_t i = 0; i < counts.size(); ++i) {
+        if (counts[i] <= 0)
+            continue;
+        reduced_ids.emplace_back(filtered_ids[i]);
+        reduced_counts.emplace_back(counts[i]);
+    }
+    if (reduced_ids.empty())
+        return {};
+    filtered_ids = std::move(reduced_ids);
+    counts = std::move(reduced_counts);
+
+    const int total = std::accumulate(counts.begin(), counts.end(), 0);
+    if (total <= 0)
+        return {};
+
+    const size_t cycle = size_t(total);
+
+    std::vector<unsigned int> sequence;
+    sequence.reserve(cycle);
+    std::vector<int> emitted(counts.size(), 0);
+    for (size_t pos = 0; pos < cycle; ++pos) {
+        size_t best_idx = 0;
+        double best_score = -1e9;
+        for (size_t i = 0; i < counts.size(); ++i) {
+            const double target = double(pos + 1) * double(counts[i]) / double(total);
+            const double score = target - double(emitted[i]);
+            if (score > best_score) {
+                best_score = score;
+                best_idx = i;
+            }
+        }
+        ++emitted[best_idx];
+        sequence.emplace_back(filtered_ids[best_idx]);
+    }
+    return sequence;
+}
+
+static bool local_z_eligible_mixed_definition(const MixedFilamentDefinition &definition)
+{
+    // Local-Z flow-height modulation should apply to all mixed rows that are
+    // resolved as A/B blends on model surfaces, not only custom rows.
+    return !definition.visibility.tombstoned && !definition.recipe.manual_pattern;
+}
+
+static bool local_z_gradient_mixed_definition(const MixedFilamentDefinition &definition)
+{
+    if (!local_z_eligible_mixed_definition(definition) || !definition.behavior.gradient.enabled)
+        return false;
+
+    const std::optional<MixedFilamentPrimaryPairView> pair = definition.recipe.blend.primary_pair();
+    return pair && pair->component_a.id != pair->component_b.id;
+}
+
+static std::vector<int> fill_continuous_layer_range(std::vector<int> layers)
+{
+    if (layers.empty())
+        return {};
+
+    std::sort(layers.begin(), layers.end());
+    layers.erase(std::unique(layers.begin(), layers.end()), layers.end());
+
+    std::vector<int> out;
+    out.reserve(size_t(layers.back() - layers.front() + 1));
+    for (int layer = layers.front(); layer <= layers.back(); ++layer)
+        out.emplace_back(layer);
+    return out;
+}
+
+static std::vector<double> build_local_z_gradient_stop_positions(const MixedFilamentDefinition &definition,
+                                                                 size_t                         num_physical,
+                                                                 size_t                         component_count)
+{
+    const size_t expected_stops = component_count >= 2 ? 2 * component_count - 1 : size_t(0);
+    if (expected_stops < 3)
+        return {};
+
+    std::vector<double> out;
+    const std::vector<float> &explicit_positions = definition.behavior.gradient.stop_positions;
+    if (explicit_positions.size() == expected_stops) {
+        out.reserve(expected_stops);
+        for (const float position : explicit_positions) {
+            if (!std::isfinite(position)) {
+                out.clear();
+                break;
+            }
+            out.emplace_back(std::clamp(double(position), 0.0, 1.0));
+        }
+    }
+
+    if (out.empty() && component_count >= 3) {
+        const std::vector<int> weights = definition.recipe.blend.component_percents(num_physical);
+        if (weights.size() == component_count) {
+            double total = 0.0;
+            for (const int weight : weights)
+                total += double(std::max(0, weight));
+            if (total > EPSILON) {
+                std::vector<double> boundaries(component_count + 1, 0.0);
+                for (size_t i = 0; i < component_count; ++i)
+                    boundaries[i + 1] = boundaries[i] + double(std::max(0, weights[i])) / total;
+                boundaries.front() = 0.0;
+                boundaries.back() = 1.0;
+
+                out.assign(expected_stops, 0.0);
+                out.front() = 0.0;
+                out.back() = 1.0;
+                for (size_t i = 0; i + 1 < component_count; ++i)
+                    out[2 * i + 1] = std::clamp(boundaries[i + 1], 0.0, 1.0);
+                for (size_t i = 1; i + 1 < component_count; ++i)
+                    out[2 * i] = std::clamp((boundaries[i] + boundaries[i + 1]) * 0.5, 0.0, 1.0);
+            }
+        }
+    }
+
+    if (out.size() != expected_stops)
+        return {};
+
+    out.front() = 0.0;
+    out.back() = 1.0;
+    constexpr double min_gap = 1e-6;
+    for (size_t i = 1; i < out.size(); ++i)
+        out[i] = std::max(out[i], out[i - 1] + min_gap);
+    out.back() = 1.0;
+    for (size_t i = out.size() - 1; i > 0; --i)
+        out[i - 1] = std::min(out[i - 1], out[i] - min_gap);
+    out.front() = 0.0;
+    for (double &position : out)
+        position = std::clamp(position, 0.0, 1.0);
+    return out;
+}
+
+static bool local_z_direct_multicolor_definition(const MixedFilamentDefinition &definition,
+                                                 size_t                         num_physical,
+                                                 std::vector<unsigned int>     *component_ids = nullptr,
+                                                 std::vector<int>              *component_weights = nullptr)
+{
+    if (!local_z_eligible_mixed_definition(definition) || definition.behavior.gradient.enabled)
+        return false;
+
+    const std::vector<unsigned int> ids = decode_blend_component_ids(definition, num_physical);
+    if (ids.size() < 3)
+        return false;
+
+    if (component_ids != nullptr)
+        *component_ids = ids;
+    if (component_weights != nullptr) {
+        std::vector<int> weights = decode_blend_component_weights(definition, num_physical, ids.size());
+        if (weights.empty())
+            weights.assign(ids.size(), 1);
+        *component_weights = std::move(weights);
+    }
+    return true;
+}
+
+struct LocalZActivePair
+{
+    unsigned int component_a = 0;
+    unsigned int component_b = 0;
+    int          mix_b_percent = 50;
+    bool         uses_layer_cycle_sequence = false;
+    bool         single_component = false;
+
+    bool valid_pair(size_t num_physical) const
+    {
+        return component_a > 0 && component_a <= num_physical &&
+               component_b > 0 && component_b <= num_physical &&
+               (component_a != component_b || single_component);
+    }
+};
+
+static int local_z_mix_b_percent_from_fraction(double b_fraction)
+{
+    return std::clamp(int(std::lround(100.0 * std::clamp(b_fraction, 0.0, 1.0))), 1, 99);
+}
+
+static void local_z_orient_pair_to_follow_previous(LocalZActivePair &pair, unsigned int previous_extruder)
+{
+    if (pair.single_component)
+        return;
+
+    // Gradient Local-Z rows use B/A pass order. If the previous emitted pass
+    // was B, flip the pair so the next nominal layer starts with the other
+    // component and does not create a doubled physical layer at the boundary.
+    if (previous_extruder != 0 && previous_extruder == pair.component_b && previous_extruder != pair.component_a) {
+        std::swap(pair.component_a, pair.component_b);
+        pair.mix_b_percent = std::clamp(100 - pair.mix_b_percent, 1, 99);
+    }
+}
+
+static bool local_z_gradient_active_pair_for_progress(const std::vector<unsigned int>& ids,
+                                                      const std::vector<double>&       stop_positions,
+                                                      double                           progress,
+                                                      double                           middle_window_fraction,
+                                                      LocalZActivePair&                pair_out,
+                                                      const std::vector<float>&        solid_widths)
+{
+    if (ids.size() < 2 || (ids.size() == 2 && stop_positions.size() != 3))
+        return false;
+    MixedFilamentDefinition definition;
+    definition.behavior.gradient.enabled = true;
+    definition.behavior.gradient.stop_positions.assign(stop_positions.begin(), stop_positions.end());
+    definition.behavior.gradient.solid_widths = solid_widths;
+    for (unsigned int id : ids)
+        definition.recipe.blend.components.push_back({{id}, 1});
+    const auto sample         = sample_mixed_gradient(definition, 0, progress, middle_window_fraction);
+    pair_out = LocalZActivePair{};
+    pair_out.component_a      = sample.component_a;
+    pair_out.component_b      = sample.component_b;
+    pair_out.mix_b_percent    = sample.mix_b_percent;
+    pair_out.single_component = sample.component_a == sample.component_b;
+    return sample.component_a != 0 && sample.component_b != 0;
+}
+
+static void append_local_z_pair_option(std::vector<LocalZActivePair> &out,
+                                       unsigned int                   component_a,
+                                       unsigned int                   component_b,
+                                       int                            weight_a,
+                                       int                            weight_b)
+{
+    if (component_a == 0 || component_b == 0 || component_a == component_b)
+        return;
+
+    LocalZActivePair pair;
+    pair.component_a = component_a;
+    pair.component_b = component_b;
+    pair.uses_layer_cycle_sequence = true;
+
+    const int safe_weight_a = std::max(0, weight_a);
+    const int safe_weight_b = std::max(0, weight_b);
+    const int pair_total    = std::max(1, safe_weight_a + safe_weight_b);
+    pair.mix_b_percent =
+        std::clamp(int(std::lround(100.0 * double(safe_weight_b) / double(pair_total))), 1, 99);
+    out.emplace_back(pair);
+}
+
+static std::vector<LocalZActivePair> build_local_z_pair_cycle_for_definition(const MixedFilamentDefinition &definition, size_t num_physical)
+{
+    std::vector<LocalZActivePair> pair_options;
+    if (definition.visibility.tombstoned || num_physical == 0 || definition.behavior.gradient.enabled)
+        return pair_options;
+
+    const std::vector<unsigned int> blend_ids = definition.recipe.blend.component_ids(num_physical);
+    if (blend_ids.size() < 3)
+        return pair_options;
+
+    std::vector<int> gradient_weights = decode_blend_component_weights(definition, num_physical, blend_ids.size());
+    if (gradient_weights.empty())
+        gradient_weights.assign(blend_ids.size(), 1);
+
+    std::vector<int> pair_weights;
+    if (blend_ids.size() >= 4) {
+        append_local_z_pair_option(pair_options, blend_ids[0], blend_ids[1], gradient_weights[0], gradient_weights[1]);
+        append_local_z_pair_option(pair_options, blend_ids[2], blend_ids[3], gradient_weights[2], gradient_weights[3]);
+        pair_weights.emplace_back(std::max(1, gradient_weights[0] + gradient_weights[1]));
+        pair_weights.emplace_back(std::max(1, gradient_weights[2] + gradient_weights[3]));
+    } else {
+        append_local_z_pair_option(pair_options, blend_ids[0], blend_ids[1], gradient_weights[0], gradient_weights[1]);
+        append_local_z_pair_option(pair_options, blend_ids[0], blend_ids[2], gradient_weights[0], gradient_weights[2]);
+        append_local_z_pair_option(pair_options, blend_ids[1], blend_ids[2], gradient_weights[1], gradient_weights[2]);
+        pair_weights.emplace_back(std::max(1, gradient_weights[0] + gradient_weights[1]));
+        pair_weights.emplace_back(std::max(1, gradient_weights[0] + gradient_weights[2]));
+        pair_weights.emplace_back(std::max(1, gradient_weights[1] + gradient_weights[2]));
+    }
+
+    if (pair_options.size() < 2 || pair_options.size() != pair_weights.size())
+        return {};
+
+    std::vector<unsigned int> pair_ids(pair_options.size(), 0);
+    for (size_t idx = 0; idx < pair_ids.size(); ++idx)
+        pair_ids[idx] = unsigned(idx + 1);
+
+    const size_t max_pair_layers =
+        definition.behavior.local_z.max_sublayers >= 2 ?
+            std::max<size_t>(1, size_t(definition.behavior.local_z.max_sublayers) / 2) :
+            size_t(0);
+    const std::vector<unsigned int> pair_sequence = build_weighted_gradient_sequence(pair_ids, pair_weights, max_pair_layers);
+    if (pair_sequence.empty())
+        return {};
+
+    std::vector<LocalZActivePair> out;
+    out.reserve(pair_sequence.size());
+    for (const unsigned int pair_token : pair_sequence) {
+        if (pair_token < 1 || pair_token > pair_options.size())
+            continue;
+        out.emplace_back(pair_options[size_t(pair_token - 1)]);
+    }
+    return out;
+}
+
+static std::vector<double> build_local_z_direct_multicolor_pass_heights(const MixedFilamentDefinition &definition,
+                                                                        const std::vector<int>       &component_weights,
+                                                                        double                        base_height,
+                                                                        double                        min_sublayer_height,
+                                                                        size_t                        component_count)
+{
+    if (base_height <= EPSILON || component_count == 0)
+        return {};
+
+    const double lo = std::max<double>(0.01, min_sublayer_height);
+    const double hi = std::max<double>(lo, base_height);
+    const size_t min_passes = size_t(std::max<double>(1.0, std::ceil((base_height - EPSILON) / hi)));
+    const size_t max_passes = size_t(std::max<double>(1.0, std::floor((base_height + EPSILON) / lo)));
+    if (max_passes == 0)
+        return { base_height };
+
+    size_t pass_limit = max_passes;
+    if (definition.behavior.local_z.max_sublayers >= 2)
+        pass_limit = std::min(pass_limit, size_t(std::max(2, definition.behavior.local_z.max_sublayers)));
+    pass_limit = std::max(pass_limit, min_passes);
+
+    std::vector<int> positive_weights;
+    positive_weights.reserve(component_weights.size());
+    for (const int weight : component_weights)
+        if (weight > 0)
+            positive_weights.emplace_back(weight);
+    if (positive_weights.empty())
+        positive_weights.assign(component_count, 1);
+
+    const int total_weight = std::max(1, std::accumulate(positive_weights.begin(), positive_weights.end(), 0));
+    std::vector<double> component_targets;
+    component_targets.reserve(positive_weights.size());
+    size_t ideal_passes = 0;
+    for (const int weight : positive_weights) {
+        const double target = base_height * double(weight) / double(total_weight);
+        component_targets.emplace_back(target);
+        ideal_passes += size_t(std::max<double>(1.0, std::ceil((target - EPSILON) / hi)));
+    }
+
+    const size_t preferred_passes = std::max(component_targets.size(), ideal_passes);
+    const size_t desired_passes   = std::min(std::max(preferred_passes, min_passes), pass_limit);
+
+    std::vector<double> bins = component_targets;
+    while (bins.size() > desired_passes) {
+        std::sort(bins.begin(), bins.end());
+        const double merged = bins[0] + bins[1];
+        bins.erase(bins.begin(), bins.begin() + 2);
+        bins.emplace_back(merged);
+    }
+
+    while (bins.size() < desired_passes) {
+        auto it = std::max_element(bins.begin(), bins.end());
+        if (it == bins.end())
+            break;
+        const double value = *it;
+        if (value < 2.0 * lo - EPSILON)
+            break;
+        double first = std::clamp(value * 0.5, lo, value - lo);
+        double second = value - first;
+        if (first < lo - EPSILON || second < lo - EPSILON)
+            break;
+        *it = first;
+        bins.emplace_back(second);
+    }
+
+    if (bins.empty())
+        return build_uniform_local_z_pass_heights(base_height, lo, desired_passes);
+
+    std::sort(bins.begin(), bins.end(), std::greater<double>());
+    for (double &value : bins)
+        value = std::clamp(value, lo, hi);
+    if (fit_pass_heights_to_interval(bins, base_height, lo, hi))
+        return bins;
+
+    for (size_t pass_count = desired_passes; pass_count >= min_passes; --pass_count) {
+        std::vector<double> exact = build_uniform_local_z_pass_heights_exact(base_height, min_sublayer_height, pass_count);
+        if (!exact.empty())
+            return exact;
+        if (pass_count == min_passes)
+            break;
+    }
+
+    return build_uniform_local_z_pass_heights(base_height, lo, desired_passes);
+}
+
+static std::vector<unsigned int> build_local_z_direct_multicolor_sequence(const std::vector<unsigned int> &component_ids,
+                                                                          const std::vector<int>          &component_weights,
+                                                                          const std::vector<double>       &pass_heights,
+                                                                          std::vector<double>            &carry_error_mm)
+{
+    if (component_ids.empty() || pass_heights.empty())
+        return {};
+
+    std::vector<unsigned int> filtered_ids;
+    std::vector<int>          filtered_weights;
+    filtered_ids.reserve(component_ids.size());
+    filtered_weights.reserve(component_ids.size());
+    for (size_t idx = 0; idx < component_ids.size(); ++idx) {
+        const int weight = idx < component_weights.size() ? std::max(0, component_weights[idx]) : 0;
+        if (weight <= 0)
+            continue;
+        filtered_ids.emplace_back(component_ids[idx]);
+        filtered_weights.emplace_back(weight);
+    }
+    if (filtered_ids.empty()) {
+        filtered_ids = component_ids;
+        filtered_weights.assign(component_ids.size(), 1);
+    }
+    if (filtered_ids.empty())
+        return {};
+
+    if (carry_error_mm.size() != filtered_ids.size())
+        carry_error_mm.assign(filtered_ids.size(), 0.0);
+
+    const double total_height = std::accumulate(pass_heights.begin(), pass_heights.end(), 0.0);
+    const int total_weight = std::max(1, std::accumulate(filtered_weights.begin(), filtered_weights.end(), 0));
+
+    std::vector<double> desired_heights(filtered_ids.size(), 0.0);
+    for (size_t idx = 0; idx < filtered_ids.size(); ++idx)
+        desired_heights[idx] = total_height * double(filtered_weights[idx]) / double(total_weight) + carry_error_mm[idx];
+
+    std::vector<double>       assigned_heights(filtered_ids.size(), 0.0);
+    std::vector<unsigned int> sequence;
+    sequence.reserve(pass_heights.size());
+    int previous_choice = -1;
+
+    for (const double pass_height : pass_heights) {
+        size_t best_idx   = 0;
+        double best_score = -std::numeric_limits<double>::infinity();
+        double best_need  = -std::numeric_limits<double>::infinity();
+        for (size_t idx = 0; idx < filtered_ids.size(); ++idx) {
+            const double remaining_need = desired_heights[idx] - assigned_heights[idx];
+            double       score          = remaining_need;
+            if (int(idx) == previous_choice)
+                score -= 0.35 * pass_height;
+
+            if (score > best_score + 1e-9 ||
+                (std::abs(score - best_score) <= 1e-9 &&
+                 (remaining_need > best_need + 1e-9 ||
+                  (std::abs(remaining_need - best_need) <= 1e-9 && filtered_ids[idx] < filtered_ids[best_idx])))) {
+                best_idx   = idx;
+                best_score = score;
+                best_need  = remaining_need;
+            }
+        }
+
+        assigned_heights[best_idx] += pass_height;
+        previous_choice = int(best_idx);
+        sequence.emplace_back(filtered_ids[best_idx]);
+    }
+
+    for (size_t idx = 0; idx < filtered_ids.size(); ++idx)
+        carry_error_mm[idx] = desired_heights[idx] - assigned_heights[idx];
+
+    const double error_sum = std::accumulate(carry_error_mm.begin(), carry_error_mm.end(), 0.0);
+    if (!carry_error_mm.empty() && std::abs(error_sum) > 1e-9) {
+        const double correction = error_sum / double(carry_error_mm.size());
+        for (double &value : carry_error_mm)
+            value -= correction;
+    }
+
+    return sequence;
+}
+
+struct LocalZIndependentDirectPass
+{
+    unsigned int extruder_id { 0 };
+    double       height { 0.0 };
+};
+
+static double local_z_max_layer_height_for_extruder(const PrintConfig &print_config, unsigned int extruder_id)
+{
+    const size_t extruder_idx = extruder_id > 0 ? size_t(extruder_id - 1) : 0;
+    const double configured_max =
+        print_config.max_layer_height.values.empty() ? 0.0 : print_config.max_layer_height.get_at(extruder_idx);
+    const double nozzle_diameter =
+        print_config.nozzle_diameter.values.empty() ? 0.4 : print_config.nozzle_diameter.get_at(extruder_idx);
+    return std::max(0.01, configured_max > EPSILON ? configured_max : 0.75 * nozzle_diameter);
+}
+
+static std::vector<LocalZIndependentDirectPass> build_local_z_independent_direct_cadence(
+    const std::vector<unsigned int> &component_ids,
+    const std::vector<int>          &component_weights,
+    double                           min_sublayer_height,
+    const PrintConfig               &print_config)
+{
+    std::vector<LocalZIndependentDirectPass> cadence;
+    if (component_ids.empty())
+        return cadence;
+
+    int minimum_positive_weight = std::numeric_limits<int>::max();
+    for (size_t idx = 0; idx < component_ids.size(); ++idx) {
+        const int weight = idx < component_weights.size() ? component_weights[idx] : 0;
+        if (component_ids[idx] > 0 && weight > 0)
+            minimum_positive_weight = std::min(minimum_positive_weight, weight);
+    }
+    if (minimum_positive_weight == std::numeric_limits<int>::max())
+        return cadence;
+
+    const double minimum = std::max<double>(0.01, min_sublayer_height);
+    for (size_t idx = 0; idx < component_ids.size(); ++idx) {
+        const int weight = idx < component_weights.size() ? component_weights[idx] : 0;
+        if (component_ids[idx] == 0 || weight <= 0)
+            continue;
+
+        const double total_component_height =
+            minimum * double(weight) / double(minimum_positive_weight);
+        const double max_layer_height =
+            local_z_max_layer_height_for_extruder(print_config, component_ids[idx]);
+        const size_t split_count = std::max<size_t>(
+            1,
+            size_t(std::ceil(total_component_height / max_layer_height - EPSILON)));
+        const double split_height = total_component_height / double(split_count);
+        for (size_t split_idx = 0; split_idx < split_count; ++split_idx)
+            cadence.push_back(LocalZIndependentDirectPass{component_ids[idx], split_height});
+    }
+    return cadence;
+}
+
+static double adaptive_local_z_full_resolution_height(const std::vector<unsigned int> &component_ids,
+                                                      const std::vector<int>          &component_weights,
+                                                      double                           nominal_layer_height)
+{
+    if (component_ids.size() < 2 || component_weights.size() != component_ids.size())
+        return 0.0;
+
+    int total_weight    = 0;
+    int smallest_weight = std::numeric_limits<int>::max();
+    for (size_t component_idx = 0; component_idx < component_ids.size(); ++component_idx) {
+        const int weight = component_weights[component_idx];
+        if (component_ids[component_idx] == 0 || weight <= 0)
+            continue;
+        total_weight    += weight;
+        smallest_weight = std::min(smallest_weight, weight);
+    }
+    if (total_weight <= 0 || smallest_weight == std::numeric_limits<int>::max())
+        return 0.0;
+
+    return nominal_layer_height * double(smallest_weight) / double(total_weight);
+}
+
+static std::vector<double> adaptive_local_z_bounded_heights(const std::vector<unsigned int> &component_ids,
+                                                            const std::vector<int>          &component_weights,
+                                                            double                           nominal_layer_height,
+                                                            double                           min_sublayer_height)
+{
+    std::vector<double> heights(component_ids.size(), 0.0);
+    if (component_ids.empty() || component_weights.size() != component_ids.size() || nominal_layer_height <= EPSILON)
+        return heights;
+
+    std::vector<size_t> active;
+    active.reserve(component_ids.size());
+    for (size_t component_idx = 0; component_idx < component_ids.size(); ++component_idx)
+        if (component_ids[component_idx] != 0 && component_weights[component_idx] > 0)
+            active.emplace_back(component_idx);
+    if (active.empty())
+        return heights;
+
+    std::vector<double> active_weights;
+    active_weights.reserve(active.size());
+    for (size_t component_idx : active)
+        active_weights.emplace_back(double(component_weights[component_idx]));
+    const std::vector<double> active_heights =
+        colorin_allocate_adaptive_local_z_heights(active_weights, nominal_layer_height, min_sublayer_height);
+    for (size_t active_idx = 0; active_idx < active.size(); ++active_idx)
+        heights[active[active_idx]] = active_heights[active_idx];
+    return heights;
+}
+
+static std::vector<LocalZIndependentDirectPass> build_adaptive_local_z_modulated_cadence(
+    const std::vector<unsigned int> &component_ids,
+    const std::vector<int>          &component_weights,
+    double                           nominal_layer_height,
+    double                           min_sublayer_height,
+    const PrintConfig               &print_config)
+{
+    std::vector<LocalZIndependentDirectPass> cadence;
+    if (component_ids.size() < 2 || component_weights.size() != component_ids.size())
+        return cadence;
+
+    const std::vector<double> component_heights = adaptive_local_z_bounded_heights(component_ids,
+                                                                                    component_weights,
+                                                                                    nominal_layer_height,
+                                                                                    min_sublayer_height);
+    for (size_t component_idx = 0; component_idx < component_ids.size(); ++component_idx) {
+        const unsigned int component_id = component_ids[component_idx];
+        const double       component_height = component_heights[component_idx];
+        if (component_id == 0 || component_height <= EPSILON)
+            continue;
+        cadence.push_back(LocalZIndependentDirectPass{component_id, component_height});
+    }
+    (void)print_config;
+    return cadence;
+}
+
+static void append_local_z_independent_component_height(std::vector<LocalZIndependentDirectPass> &cadence,
+                                                        unsigned int                               component_id,
+                                                        double                                     total_height,
+                                                        const PrintConfig                         &print_config)
+{
+    if (component_id == 0 || total_height <= EPSILON)
+        return;
+
+    const double max_layer_height = local_z_max_layer_height_for_extruder(print_config, component_id);
+    const size_t split_count = std::max<size_t>(
+        1,
+        size_t(std::ceil(total_height / max_layer_height - EPSILON)));
+    const double split_height = total_height / double(split_count);
+    for (size_t split_idx = 0; split_idx < split_count; ++split_idx)
+        cadence.push_back(LocalZIndependentDirectPass{component_id, split_height});
+}
+
+static std::vector<LocalZIndependentDirectPass> build_local_z_independent_gradient_cadence(const MixedGradientLocalZSample& sample,
+                                                                                           double             available_height,
+                                                                                           double             min_sublayer_height,
+                                                                                           unsigned int       previous_extruder,
+                                                                                           const PrintConfig& print_config)
+{
+    std::vector<LocalZIndependentDirectPass> cadence;
+    if (available_height <= EPSILON || sample.mix.component_a == 0 || sample.mix.component_b == 0)
+        return cadence;
+
+    LocalZActivePair pair;
+    pair.component_a      = sample.mix.component_a;
+    pair.component_b      = sample.mix.component_b;
+    pair.mix_b_percent    = sample.mix.mix_b_percent;
+    pair.single_component = pair.component_a == pair.component_b;
+    double height_a       = sample.height_a;
+    double height_b       = sample.height_b;
+    if (height_a + height_b > available_height) {
+        const auto clipped = mixed_filament_local_z_pair_heights(available_height, min_sublayer_height, pair.mix_b_percent);
+        height_a           = clipped.first;
+        height_b           = clipped.second;
+    }
+    local_z_orient_pair_to_follow_previous(pair, previous_extruder);
+    if (pair.component_a != sample.mix.component_a)
+        std::swap(height_a, height_b);
+    // Retain the established B/A order and per-extruder maximum-height splitting.
+    append_local_z_independent_component_height(cadence, pair.component_b, height_b, print_config);
+    append_local_z_independent_component_height(cadence, pair.component_a, height_a, print_config);
+    return cadence;
+}
+
+static LocalZActivePair derive_local_z_active_pair(const MixedFilamentDefinition     &definition,
+                                                   const std::vector<LocalZActivePair> &pair_cycle,
+                                                   size_t                              num_physical,
+                                                   int                                 cadence_index)
+{
+    LocalZActivePair out;
+
+    if (!pair_cycle.empty()) {
+        const int cycle_i = int(pair_cycle.size());
+        const size_t pos  = size_t(((cadence_index % cycle_i) + cycle_i) % cycle_i);
+        return pair_cycle[pos];
+    }
+
+    const MixedFilamentPrimaryPairView pair = definition.recipe.blend.primary_pair_or(0, 0);
+    out.component_a = pair.component_a.id;
+    out.component_b = pair.component_b.id;
+    out.mix_b_percent = pair.component_b_percent;
+    out.uses_layer_cycle_sequence = false;
+    return out;
+}
+
+// ---- end Prusa Colorin Local-Z parte 1 ----
                                << " expanded_regions=" << expanded_regions
                                << " stolen_regions=" << stolen_regions;
     return true;
@@ -1713,6 +2889,14 @@ void apply_mm_segmentation(PrintObject &print_object, ThrowOnCancel throw_on_can
 
                     layer.get_region(region_id)->m_slices.set(std::move(src.expolygons), stInternal);
                 }
+
+                // Prusa Colorin (Orca 0.9.18): diagnostico de emboss con mezcla tras la segmentacion.
+                dump_surface_emboss_mixed_layer_state("post-mm-segmentation",
+                                                      print_object,
+                                                      layer_id,
+                                                      layer,
+                                                      layer_range,
+                                                      &segmentation[layer_id]);
             }
         });
 }
