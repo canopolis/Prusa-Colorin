@@ -18,6 +18,8 @@
 #include "slic3r/GUI/OpenGLManager.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/MixedFilament.hpp" // Prusa Colorin (FullSpectrum)
+#include "slic3r/GUI/MixedColorMatchHelpers.hpp" // Prusa Colorin (FullSpectrum)
+#include <optional>
 #include "libslic3r/Model.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 
@@ -97,6 +99,67 @@ bool GLGizmoMmuSegmentation::on_is_activable() const
 }
 
 
+// Prusa Colorin: helpers copied from Orca FullSpectrum 0.9.18 GLGizmoMmuSegmentation.cpp
+// --- Gradient rendering helpers (ported from MixedFilamentBadge) ---
+
+static ImU32 interpolate_ImU32(ImU32 c0, ImU32 c1, double t)
+{
+    t = std::max(0.0, std::min(1.0, t));
+    int r = int(((c0 >> IM_COL32_R_SHIFT) & 0xFF) * (1.0 - t) + ((c1 >> IM_COL32_R_SHIFT) & 0xFF) * t);
+    int g = int(((c0 >> IM_COL32_G_SHIFT) & 0xFF) * (1.0 - t) + ((c1 >> IM_COL32_G_SHIFT) & 0xFF) * t);
+    int b = int(((c0 >> IM_COL32_B_SHIFT) & 0xFF) * (1.0 - t) + ((c1 >> IM_COL32_B_SHIFT) & 0xFF) * t);
+    return IM_COL32(r, g, b, 255);
+}
+
+static ImU32 interpolate_ImU32(const std::vector<ImU32>& colors, double pos)
+{
+    if (colors.empty())
+        return IM_COL32(0x26, 0xA6, 0x9A, 255);
+    if (colors.size() == 1)
+        return colors.front();
+
+    pos = std::clamp(pos, 0.0, 1.0);
+    const double scaled = pos * double(colors.size() - 1);
+    const size_t segment = std::min<size_t>(colors.size() - 2, size_t(std::floor(scaled)));
+    const double local = scaled - double(segment);
+    return interpolate_ImU32(colors[segment], colors[segment + 1], local);
+}
+
+static float bT601_luminance(ImU32 c)
+{
+    float r = ((c >> IM_COL32_R_SHIFT) & 0xFF) / 255.0f;
+    float g = ((c >> IM_COL32_G_SHIFT) & 0xFF) / 255.0f;
+    float b = ((c >> IM_COL32_B_SHIFT) & 0xFF) / 255.0f;
+    return 0.299f * r + 0.587f * g + 0.114f * b;
+}
+
+static bool very_light(ImU32 c)
+{
+    return ((c >> IM_COL32_R_SHIFT) & 0xFF) > 224
+        && ((c >> IM_COL32_G_SHIFT) & 0xFF) > 224
+        && ((c >> IM_COL32_B_SHIFT) & 0xFF) > 224;
+}
+
+static bool is_gradient_definition(const MixedFilamentDefinition& definition)
+{
+    return definition.recipe.kind == MixedFilamentRecipeKind::WeightedBlend &&
+           definition.behavior.gradient.enabled &&
+           definition.recipe.blend.components.size() >= 2;
+}
+
+static std::vector<ImU32> mixed_filament_gradient_stops_ImU32(const MixedFilamentDefinition& definition,
+                                                              const MixedFilamentDisplayContext& ctx)
+{
+    const std::vector<wxColour> preview_colors =
+        build_mixed_filament_gradient_preview(definition, ctx).sampled_colors;
+
+    std::vector<ImU32> colors;
+    colors.reserve(preview_colors.size());
+    for (const wxColour& color : preview_colors)
+        colors.emplace_back(IM_COL32(color.Red(), color.Green(), color.Blue(), 255));
+    return colors;
+}
+
 static std::vector<std::string> get_extruders_names()
 {
     const size_t physical_extruders_cnt = wxGetApp().extruders_edited_cnt();
@@ -158,7 +221,7 @@ bool GLGizmoMmuSegmentation::on_init()
     m_desc["first_color_caption"]  = _u8L("Left mouse button") + ": ";
     m_desc["first_color"]          = _u8L("First color");
     m_desc["second_color_caption"] = _u8L("Right mouse button") + ": ";
-    m_desc["second_color"]         = _u8L("Second color");
+    m_desc["second_color"]         = _u8L("Erase"); // Prusa Colorin: right mouse button erases (Orca 0.9.18)
     m_desc["remove_caption"]       = _u8L("Shift + Left mouse button") + ": ";
     m_desc["remove"]               = _u8L("Remove painted color");
 
@@ -403,36 +466,149 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
 
     ImGui::Separator();
 
-    ImGui::AlignTextToFramePadding();
-    ImGuiPureWrap::text(m_desc.at("first_color"));
-    ImGui::SameLine(combo_label_width);
-    ImGui::PushItemWidth(window_width - combo_label_width - color_button_width);
-    render_extruders_combo("##first_color_combo", m_original_extruders_names, m_original_extruders_colors, m_first_selected_extruder_idx);
-    ImGui::SameLine();
+    // Prusa Colorin: filament grid of Orca FullSpectrum 0.9.18 (numbered physical filaments,
+    // lettered mixed filaments, gradient swatches, mixed filaments on their own row when > 10).
+    // Left mouse button paints with the selected filament, right mouse button erases.
+    {
+        const float max_grid_tooltip_width = ImGui::GetFontSize() * 20.0f;
+        ImDrawList *draw_list = ImGui::GetWindowDrawList();
 
-    const ColorRGBA& select_first_color = m_modified_extruders_colors[m_first_selected_extruder_idx];
-    ImVec4           first_color        = ImGuiPSWrap::to_ImVec4(select_first_color);
-    const std::string first_label       = into_u8(m_desc.at("first_color")) + "##color_picker";
-    if (ImGui::ColorEdit4(first_label.c_str(), (float*)&first_color, ImGuiColorEditFlags_NoAlpha | ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel,
-        // TRN Means "current color"
-        _u8L("Current").c_str(),
-        // TRN Means "original color"
-        _u8L("Original").c_str()))
-        m_modified_extruders_colors[m_first_selected_extruder_idx] = ImGuiPSWrap::from_ImVec4(first_color);
+        std::vector<std::string> physical_hex = wxGetApp().plater()->get_extruder_color_strings_from_plater_config();
+        const size_t num_physical = size_t(std::max(wxGetApp().extruders_edited_cnt(), 0));
+        if (physical_hex.size() > num_physical)
+            physical_hex.resize(num_physical);
+        const MixedFilamentDisplayContext mixed_ctx = build_mixed_filament_display_context(physical_hex);
 
-    ImGui::AlignTextToFramePadding();
-    ImGuiPureWrap::text(m_desc.at("second_color"));
-    ImGui::SameLine(combo_label_width);
-    ImGui::PushItemWidth(window_width - combo_label_width - color_button_width);
-    render_extruders_combo("##second_color_combo", m_original_extruders_names, m_original_extruders_colors, m_second_selected_extruder_idx);
-    ImGui::SameLine();
+        const int   max_filament_items_per_line = 8;
+        const float font_size             = ImGui::GetFontSize() * 0.85f;
+        const float filament_button_h     = std::round(ImGui::GetFrameHeight() + m_imgui->scaled(0.2f));
+        const float filament_button_w     = filament_button_h;
+        const float filament_item_spacing = m_imgui->scaled(0.75f);
+        const float filament_item_width   = filament_button_w + filament_item_spacing;
 
-    const ColorRGBA& select_second_color = m_modified_extruders_colors[m_second_selected_extruder_idx];
-    ImVec4           second_color        = ImGuiPSWrap::to_ImVec4(select_second_color);
-    const std::string second_label       = into_u8(m_desc.at("second_color")) + "##color_picker";
-    if (ImGui::ColorEdit4(second_label.c_str(), (float*)&second_color, ImGuiColorEditFlags_NoAlpha | ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel,
-        _u8L("Current").c_str(), _u8L("Original").c_str()))
-        m_modified_extruders_colors[m_second_selected_extruder_idx] = ImGuiPSWrap::from_ImVec4(second_color);
+        ImGuiPureWrap::text(_u8L("Filaments"));
+
+        const float  start_pos_x       = ImGui::GetCursorPos().x;
+        const size_t n_extruder_colors = std::min(GLGizmoMmuSegmentation::EXTRUDERS_LIMIT, m_original_extruders_colors.size());
+        const bool   separate_mixed_row = (n_extruder_colors > 10);
+        int  current_col       = 0;
+        bool prev_was_physical = false;
+
+        for (size_t extruder_idx = 0; extruder_idx < n_extruder_colors; ++extruder_idx) {
+            const unsigned int actual_filament_id = unsigned(extruder_idx + 1);
+            const bool is_mixed = colorin_mixed_visible_cnt() > 0 && actual_filament_id > num_physical;
+
+            if (separate_mixed_row && is_mixed && prev_was_physical && current_col > 0)
+                current_col = 0;
+            prev_was_physical = !is_mixed;
+
+            const ColorRGBA  &extruder_color = m_modified_extruders_colors[extruder_idx];
+            const ImVec4      color_vec      = ImGuiPSWrap::to_ImVec4(extruder_color);
+            const std::string color_label    = std::string("##extruder color ") + std::to_string(extruder_idx);
+            const std::string item_text      = !is_mixed ? std::to_string(actual_filament_id) :
+                                                           Slic3r::mixed_filament_index_to_letter(actual_filament_id - num_physical - 1);
+            const ImVec2 button_size(filament_button_w, filament_button_h);
+
+            if (current_col > 0)
+                ImGui::SameLine(start_pos_x + filament_item_width * current_col);
+
+            const std::optional<MixedFilamentDefinition> mixed_definition =
+                (is_mixed && wxGetApp().preset_bundle != nullptr) ?
+                    wxGetApp().preset_bundle->mixed_filaments.mixed_filament_definition_from_id(actual_filament_id, mixed_ctx.num_physical) :
+                    std::nullopt;
+            const bool is_gradient = mixed_definition && is_gradient_definition(*mixed_definition);
+
+            std::vector<ImU32> gradient_stops;
+            ImVec4 button_color = color_vec;
+            if (is_gradient) {
+                gradient_stops = mixed_filament_gradient_stops_ImU32(*mixed_definition, mixed_ctx);
+                int avg_r = 0, avg_g = 0, avg_b = 0;
+                for (const ImU32 stop : gradient_stops) {
+                    avg_r += int((stop >> IM_COL32_R_SHIFT) & 0xFF);
+                    avg_g += int((stop >> IM_COL32_G_SHIFT) & 0xFF);
+                    avg_b += int((stop >> IM_COL32_B_SHIFT) & 0xFF);
+                }
+                const int stop_count = std::max(1, int(gradient_stops.size()));
+                button_color = ImVec4(float(avg_r / stop_count) / 255.f, float(avg_g / stop_count) / 255.f, float(avg_b / stop_count) / 255.f, 1.f);
+            }
+
+            ImGuiColorEditFlags flags = ImGuiColorEditFlags_NoAlpha | ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel |
+                                        ImGuiColorEditFlags_NoPicker | ImGuiColorEditFlags_NoTooltip;
+            if (m_first_selected_extruder_idx != extruder_idx)
+                flags |= ImGuiColorEditFlags_NoBorder;
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGuiPureWrap::COL_ORANGE_LIGHT);
+            ImGui::PushStyleColor(ImGuiCol_Border, ImGuiPureWrap::COL_ORANGE_LIGHT);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 2.0f);
+            const bool color_picked = ImGui::ColorButton(color_label.c_str(), button_color, flags, button_size);
+            ImGui::PopStyleVar(2);
+            ImGui::PopStyleColor(2);
+            if (color_picked)
+                m_first_selected_extruder_idx = extruder_idx;
+
+            const ImVec2 btn_min = ImGui::GetItemRectMin();
+            const ImVec2 btn_max = ImGui::GetItemRectMax();
+            ImU32 text_col = IM_COL32(0, 0, 0, 255);
+
+            if (is_gradient) {
+                const float  inset = 2.5f;
+                const ImVec2 fill_min(btn_min.x + inset, btn_min.y + inset);
+                const ImVec2 fill_max(btn_max.x - inset, btn_max.y - inset);
+                const float  fill_h = fill_max.y - fill_min.y;
+                if (fill_h > 0.0f) {
+                    for (int y_i = 0; y_i < int(std::round(fill_h)); ++y_i) {
+                        const double pos = 1.0 - double(y_i) / double(fill_h);
+                        draw_list->AddRectFilled(ImVec2(fill_min.x, fill_min.y + float(y_i)),
+                                                 ImVec2(fill_max.x, fill_min.y + float(y_i + 1)),
+                                                 interpolate_ImU32(gradient_stops, pos));
+                    }
+                }
+                const bool all_stops_light = !gradient_stops.empty() &&
+                    std::all_of(gradient_stops.begin(), gradient_stops.end(), [](ImU32 color) { return very_light(color); });
+                if (all_stops_light)
+                    draw_list->AddRect(fill_min, fill_max, IM_COL32(128, 128, 128, 255), ImGui::GetStyle().FrameRounding, 0, 1.0f);
+                float lum_avg = 0.0f;
+                for (const ImU32 stop : gradient_stops)
+                    lum_avg += bT601_luminance(stop);
+                lum_avg /= float(std::max<size_t>(1, gradient_stops.size()));
+                text_col = (lum_avg < 0.51f) ? IM_COL32(255, 255, 255, 255) : IM_COL32(0, 0, 0, 255);
+            } else {
+                const float gray = 0.299f * extruder_color.r() + 0.587f * extruder_color.g() + 0.114f * extruder_color.b();
+                text_col = (gray * 255.f < 130.f) ? IM_COL32(255, 255, 255, 255) : IM_COL32(0, 0, 0, 255);
+            }
+
+            if (ImGui::IsItemHovered()) {
+                if (extruder_idx < 9)
+                    ImGuiPureWrap::tooltip(_u8L("Shortcut Key ") + std::to_string(extruder_idx + 1), max_grid_tooltip_width);
+                else if (!is_mixed)
+                    ImGuiPureWrap::tooltip(GUI::format(_L("Filament %d"), int(actual_filament_id)), max_grid_tooltip_width);
+                else
+                    ImGuiPureWrap::tooltip(GUI::format(_L("Mixed Filament %s"), item_text), max_grid_tooltip_width);
+            }
+
+            const float text_w = ImGui::GetFont()->CalcTextSizeA(font_size, FLT_MAX, 0.0f, item_text.c_str()).x;
+            draw_list->AddText(ImGui::GetFont(), font_size,
+                               ImVec2(btn_min.x + (btn_max.x - btn_min.x - text_w) / 2.f, btn_min.y + (btn_max.y - btn_min.y - font_size) / 2.f),
+                               text_col, item_text.c_str());
+
+            if (++current_col >= max_filament_items_per_line)
+                current_col = 0;
+        }
+        ImGui::Dummy(ImVec2(0.0f, ImGui::GetFontSize() * 0.1f));
+
+        if (n_extruder_colors > 0) {
+            int selected_filament = int(m_first_selected_extruder_idx) + 1;
+            ImGui::AlignTextToFramePadding();
+            ImGuiPureWrap::text(_u8L("Selected filament"));
+            ImGui::SameLine();
+            ImGui::PushItemWidth(m_imgui->scaled(4.5f));
+            if (ImGui::InputInt("##selected_filament", &selected_filament, 1, 10, ImGuiInputTextFlags_CharsDecimal)) {
+                selected_filament = std::clamp(selected_filament, 1, int(n_extruder_colors));
+                m_first_selected_extruder_idx = size_t(selected_filament - 1);
+            }
+            ImGui::PopItemWidth();
+        }
+    }
 
     const float max_tooltip_width = ImGui::GetFontSize() * 20.0f;
 
@@ -692,9 +868,8 @@ ColorRGBA GLGizmoMmuSegmentation::get_cursor_sphere_left_button_color() const
 
 ColorRGBA GLGizmoMmuSegmentation::get_cursor_sphere_right_button_color() const
 {
-    ColorRGBA color = m_modified_extruders_colors[m_second_selected_extruder_idx];
-    color.a(0.25f);
-    return color;
+    // Prusa Colorin: right mouse button erases (Orca 0.9.18), show the erase cursor colour.
+    return ColorRGBA(0.5f, 0.5f, 0.5f, 0.25f);
 }
 
 void TriangleSelectorMmGui::render(ImGuiWrapper* imgui, const Transform3d& matrix)
@@ -761,8 +936,12 @@ wxString GLGizmoMmuSegmentation::handle_snapshot_action_name(bool shift_down, GL
     if (shift_down)
         action_name = _L("Remove painted color");
     else {
-        size_t extruder_id = (button_down == Button::Left ? m_first_selected_extruder_idx : m_second_selected_extruder_idx) + 1;
-        action_name        = GUI::format(_L("Painted using: Extruder %1%"), extruder_id);
+        if (button_down == Button::Right) { // Prusa Colorin: right mouse button erases (Orca 0.9.18)
+            action_name = _L("Remove painted color");
+        } else {
+            size_t extruder_id = m_first_selected_extruder_idx + 1;
+            action_name        = GUI::format(_L("Painted using: Extruder %1%"), extruder_id);
+        }
     }
     return action_name;
 }
