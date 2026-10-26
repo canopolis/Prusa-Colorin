@@ -43,6 +43,9 @@
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/libslic3r.h"
 #include "MultiMaterialSegmentation.hpp"
+#include "ImageMap/FacetRasterizer.hpp" // Prusa Colorin (FullSpectrum)
+#include <optional> // Prusa Colorin (FullSpectrum)
+#include <memory> // Prusa Colorin (FullSpectrum)
 
 constexpr bool MM_SEGMENTATION_DEBUG_GRAPH                = false;
 constexpr bool MM_SEGMENTATION_DEBUG_REGIONS              = false;
@@ -2372,13 +2375,97 @@ static size_t calc_num_facets_states(const Print& print)
 
 // Returns multi-material segmentation based on painting in multi-material segmentation gizmo
 std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(const PrintObject &print_object, const std::function<void()> &throw_on_cancel_callback) {
-    const size_t num_facets_states  = calc_num_facets_states(*print_object.print());
+    // Prusa Colorin (FullSpectrum): as OrcaSlicer FullSpectrum 0.9.18, the persistent image map of every
+    // volume is rasterized into facet states at slice time (the model itself is not modified), so imported
+    // OBJ colour is segmented together with hand painting.
+    const Print                &print                  = *print_object.print();
+    const MixedFilamentManager &mixed_manager          = print.mixed_filament_manager();
+    const size_t                num_physical_filaments = print.config().nozzle_diameter.size();
+    const size_t                num_total_filaments    = std::max(num_physical_filaments, mixed_manager.total_filaments(num_physical_filaments));
+    const size_t num_facets_states  = std::max(calc_num_facets_states(print), num_total_filaments + 1);
     const float  max_width          = float(print_object.config().mmu_segmented_region_max_width.value);
     const float  interlocking_depth = float(print_object.config().mmu_segmented_region_interlocking_depth.value);
     const bool   interlocking_beam  = print_object.config().interlocking_beam.value;
 
-    const auto extract_facets_info = [](const ModelVolume &mv) -> ModelVolumeFacetsInfo {
-        return {mv.mm_segmentation_facets, mv.is_mm_painted(), false};
+    struct FacetSnapshot {
+        const ModelVolume                *volume { nullptr };
+        std::unique_ptr<FacetsAnnotation> facets;
+    };
+    std::vector<FacetSnapshot> facet_snapshots;
+    facet_snapshots.reserve(print_object.model_object()->volumes.size());
+    size_t rasterized_facets_total = 0;
+    for (const ModelVolume *mv : print_object.model_object()->volumes) {
+        if (mv == nullptr)
+            continue;
+        FacetSnapshot snapshot;
+        snapshot.volume = mv;
+        snapshot.facets = mv->mm_segmentation_facets.copy_for_slicing();
+        if (const std::shared_ptr<const ImageMap::VolumeData> data = mv->image_map_data(); data && !data->empty()) {
+            const unsigned int base_filament_id = unsigned(std::clamp(mv->extruder_id(), 1, int(num_total_filaments)));
+            // Adaptive zones and synchronized Simple PM are handled by later phases (Local-Z / 4c), as in Orca 0.9.18.
+            ImageMap::VolumeData facet_data = *data;
+            for (ImageMap::Zone &zone : facet_data.zones) {
+                if (zone.render_mode == ImageMap::RenderMode::AdaptiveLocalizedCycles ||
+                    (zone.render_mode == ImageMap::RenderMode::PerimeterModulationV2 &&
+                     zone.synchronize_whole_object_cadence))
+                    zone.enabled = false;
+            }
+            const ImageMap::FacetRasterization rasterized = ImageMap::rasterize_facets(
+                mv->mesh(), facet_data, base_filament_id,
+                [&mixed_manager, num_physical_filaments, num_total_filaments](const ImageMap::PaletteEntry &entry) {
+                    if (entry.mixed_filament_stable_id != 0) {
+                        const std::optional<unsigned int> stable_id =
+                            mixed_manager.filament_id_from_stable_id(entry.mixed_filament_stable_id, num_physical_filaments);
+                        if (stable_id && *stable_id <= num_total_filaments)
+                            return *stable_id;
+                    }
+                    return entry.fallback_filament_id <= num_total_filaments ? entry.fallback_filament_id : 0u;
+                });
+            for (const ImageMap::RasterizedFacet &facet : rasterized.facets) {
+                if (!facet.encoded_states.empty())
+                    snapshot.facets->set_triangle_from_string(int(facet.triangle_index), facet.encoded_states);
+            }
+            rasterized_facets_total += rasterized.facets.size();
+            if (rasterized.unresolved_palette_entries != 0) {
+                BOOST_LOG_TRIVIAL(warning) << "Image-map slice-time palette resolution fell back to the volume filament"
+                                           << " unresolved=" << rasterized.unresolved_palette_entries
+                                           << " volume=" << mv->name;
+            }
+        }
+        facet_snapshots.emplace_back(std::move(snapshot));
+    }
+
+    auto snapshot_for_volume = [&facet_snapshots](const ModelVolume &volume) -> const FacetsAnnotation & {
+        auto it = std::find_if(facet_snapshots.begin(), facet_snapshots.end(), [&volume](const FacetSnapshot &snapshot) {
+            return snapshot.volume == &volume;
+        });
+        return it == facet_snapshots.end() ? volume.mm_segmentation_facets : *it->facets;
+    };
+
+    size_t max_painted_state = 0;
+    for (const ModelVolume *mv : print_object.model_object()->volumes) {
+        if (!mv->is_model_part())
+            continue;
+        const auto &used_states = snapshot_for_volume(*mv).get_data().used_states;
+        for (size_t state_idx = static_cast<size_t>(TriangleStateType::Extruder1); state_idx < used_states.size(); ++state_idx) {
+            if (used_states[state_idx])
+                max_painted_state = std::max(max_painted_state, state_idx);
+        }
+    }
+    BOOST_LOG_TRIVIAL(info) << "Prusa Colorin: multi_material_segmentation_by_painting"
+                            << " object=" << print_object.model_object()->name
+                            << " rasterized_image_map_facets=" << rasterized_facets_total
+                            << " max_painted_state=" << max_painted_state
+                            << " num_facets_states=" << num_facets_states
+                            << " physical_filaments=" << num_physical_filaments
+                            << " total_filaments=" << num_total_filaments;
+    if (max_painted_state >= num_facets_states)
+        BOOST_LOG_TRIVIAL(warning) << "multi_material_segmentation_by_painting dropping painted states above segmentation range"
+                                   << " max_painted_state=" << max_painted_state
+                                   << " num_facets_states=" << num_facets_states;
+
+    const auto extract_facets_info = [&snapshot_for_volume](const ModelVolume &mv) -> ModelVolumeFacetsInfo {
+        return {snapshot_for_volume(mv), mv.is_mm_painted(), false};
     };
 
     return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_width, interlocking_depth, interlocking_beam, IncludeTopAndBottomLayers::Yes, throw_on_cancel_callback);

@@ -694,6 +694,8 @@ public:
     void assign(const FacetsAnnotation &rhs) { if (! this->timestamp_matches(rhs)) { m_data = rhs.m_data; this->copy_timestamp(rhs); } }
     void assign(FacetsAnnotation &&rhs) { if (! this->timestamp_matches(rhs)) { m_data = std::move(rhs.m_data); this->copy_timestamp(rhs); } }
     const TriangleSelector::TriangleSplittingData &get_data() const noexcept { return m_data; }
+    // Prusa Colorin (FullSpectrum): slice-time copy used to add the rasterized image map without touching the model.
+    std::unique_ptr<FacetsAnnotation> copy_for_slicing() const { return std::unique_ptr<FacetsAnnotation>(new FacetsAnnotation(*this)); }
     bool set(const TriangleSelector &selector);
     indexed_triangle_set get_facets(const ModelVolume &mv, TriangleStateType type) const;
     indexed_triangle_set get_facets_strict(const ModelVolume &mv, TriangleStateType type) const;
