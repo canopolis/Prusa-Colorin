@@ -20,6 +20,7 @@
 #include "libslic3r/MixedFilament.hpp" // Prusa Colorin (FullSpectrum)
 #include "slic3r/GUI/MixedColorMatchHelpers.hpp" // Prusa Colorin (FullSpectrum)
 #include <optional>
+#include <cmath>
 #include "libslic3r/Model.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 
@@ -32,7 +33,7 @@ namespace Slic3r::GUI {
 // brush offers the physical filaments followed by the mixed filaments A, B, C... and paints
 // state = physical count + mixed index (same numbering as Orca). Without mixed filaments the
 // native PrusaSlicer behaviour (physical + virtual extruders) is kept unchanged.
-static size_t colorin_mixed_visible_cnt()
+size_t colorin_mixed_visible_cnt()
 {
     if (wxGetApp().preset_bundle == nullptr)
         return 0;
@@ -41,7 +42,7 @@ static size_t colorin_mixed_visible_cnt()
     return total > num_physical ? total - num_physical : 0;
 }
 
-static std::vector<ColorRGBA> colorin_paint_colors()
+std::vector<ColorRGBA> colorin_paint_colors()
 {
     std::vector<ColorRGBA> colors = wxGetApp().plater()->get_extruder_colors_from_plater_config();
     if (colorin_mixed_visible_cnt() == 0)
@@ -55,6 +56,30 @@ static std::vector<ColorRGBA> colorin_paint_colors()
         colors.emplace_back(c);
     }
     return colors;
+}
+
+// Prusa Colorin (Orca 0.9.18 3DScene preview_gradient_colors): sampled gradient colours of every
+// mixed filament, indexed like colorin_paint_colors() (index = filament id - 1). Physical
+// filaments get an empty vector. Gradients with fewer than 2 samples are drawn as solid colour.
+std::vector<std::vector<ColorRGBA>> colorin_paint_gradients(size_t n_colors)
+{
+    std::vector<std::vector<ColorRGBA>> gradients(n_colors);
+    if (colorin_mixed_visible_cnt() == 0 || wxGetApp().preset_bundle == nullptr)
+        return gradients;
+    const size_t num_physical = size_t(std::max(wxGetApp().extruders_edited_cnt(), 0));
+    std::vector<std::string> physical_hex = wxGetApp().plater()->get_extruder_color_strings_from_plater_config();
+    if (physical_hex.size() > num_physical)
+        physical_hex.resize(num_physical);
+    const MixedFilamentDisplayContext ctx = build_mixed_filament_display_context(physical_hex);
+    for (size_t idx = num_physical; idx < n_colors; ++idx) {
+        const std::optional<MixedFilamentDefinition> definition =
+            wxGetApp().preset_bundle->mixed_filaments.mixed_filament_definition_from_id(unsigned(idx + 1), ctx.num_physical);
+        if (!definition)
+            continue;
+        for (const wxColour &color : build_mixed_filament_gradient_preview(*definition, ctx).sampled_colors)
+            gradients[idx].emplace_back(float(color.Red()) / 255.f, float(color.Green()) / 255.f, float(color.Blue()) / 255.f, 1.f);
+    }
+    return gradients;
 }
 
 
@@ -326,6 +351,7 @@ void GLGizmoMmuSegmentation::render_triangles(const Selection &selection) const
 
         shader->set_uniform("volume_world_matrix", trafo_matrix);
         shader->set_uniform("volume_mirrored", is_left_handed);
+        static_cast<TriangleSelectorMmGui*>(m_triangle_selectors[mesh_id].get())->colorin_z_range = clp_data.z_range; // Prusa Colorin
         m_triangle_selectors[mesh_id]->render(m_imgui, trafo_matrix);
 
         if (is_left_handed)
@@ -834,6 +860,7 @@ void GLGizmoMmuSegmentation::init_model_triangle_selectors()
             extruder_idx = size_t(std::max(mv->extruder_id(), 1) - 1);
         extruder_idx = std::min(extruder_idx, m_original_extruders_colors.size() - 1);
         m_triangle_selectors.emplace_back(std::make_unique<TriangleSelectorMmGui>(*mesh, m_modified_extruders_colors, m_original_extruders_colors[extruder_idx]));
+        static_cast<TriangleSelectorMmGui*>(m_triangle_selectors.back().get())->set_colorin_gradients(colorin_paint_gradients(m_original_extruders_colors.size())); // Prusa Colorin
         // Reset of TriangleSelector is done inside TriangleSelectorMmGUI's constructor, so we don't need it to perform it again in deserialize().
         m_triangle_selectors.back()->deserialize(mv->mm_segmentation_facets.get_data(), false);
         m_triangle_selectors.back()->request_update_render_data();
@@ -887,8 +914,14 @@ void TriangleSelectorMmGui::render(ImGuiWrapper* imgui, const Transform3d& matri
         if (m_gizmo_scene.has_VBOs(color_idx)) {
             if (color_idx > m_colors.size()) // Seed fill VBO
                 shader->set_uniform("uniform_color", TriangleSelectorGUI::get_seed_fill_color(color_idx == (m_colors.size() + 1) ? m_default_volume_color : m_colors[color_idx - (m_colors.size() + 1) - 1]));
-            else                             // Normal VBO
+            else {                           // Normal VBO
+                // Prusa Colorin (Orca 0.9.18 render_preview_gradient_model): gradient mixed filaments
+                // are drawn in horizontal bands along world Z, bottom to top, clipped by z_range.
+                if (color_idx >= 1 && color_idx <= m_colors.size() && color_idx - 1 < m_colorin_gradients.size() &&
+                    m_colorin_gradients[color_idx - 1].size() >= 2 && colorin_render_gradient(color_idx, matrix))
+                    continue;
                 shader->set_uniform("uniform_color", color_idx == 0 ? m_default_volume_color : m_colors[color_idx - 1]);
+            }
 
             m_gizmo_scene.render(color_idx);
         }
@@ -898,8 +931,81 @@ void TriangleSelectorMmGui::render(ImGuiWrapper* imgui, const Transform3d& matri
     m_update_render_data = false;
 }
 
+// Prusa Colorin: helpers of Orca FullSpectrum 0.9.18 3DScene.cpp (preview gradient sampling).
+static ColorRGBA colorin_interpolate_gradient_color(const ColorRGBA &a, const ColorRGBA &b, double local)
+{
+    local = std::clamp(local, 0.0, 1.0);
+    return ColorRGBA(float(double(a.r()) * (1.0 - local) + double(b.r()) * local),
+                     float(double(a.g()) * (1.0 - local) + double(b.g()) * local),
+                     float(double(a.b()) * (1.0 - local) + double(b.b()) * local),
+                     float(double(a.a()) * (1.0 - local) + double(b.a()) * local));
+}
+
+static ColorRGBA colorin_sample_gradient_color(const std::vector<ColorRGBA> &colors, double t)
+{
+    if (colors.empty())
+        return ColorRGBA::WHITE();
+    if (colors.size() == 1)
+        return colors.front();
+    const double scaled = std::clamp(t, 0.0, std::nextafter(1.0, 0.0)) * double(colors.size() - 1);
+    const size_t idx    = std::min<size_t>(colors.size() - 2, size_t(std::floor(scaled)));
+    return colorin_interpolate_gradient_color(colors[idx], colors[idx + 1], scaled - double(idx));
+}
+
+bool TriangleSelectorMmGui::colorin_render_gradient(size_t color_idx, const Transform3d &matrix)
+{
+    auto *shader = wxGetApp().get_current_shader();
+    if (shader == nullptr || !m_colorin_bbox_valid)
+        return false;
+
+    double z_min = DBL_MAX, z_max = -DBL_MAX;
+    for (int corner = 0; corner < 8; ++corner) {
+        const Vec3d p((corner & 1) ? m_colorin_bbox_max.x() : m_colorin_bbox_min.x(),
+                      (corner & 2) ? m_colorin_bbox_max.y() : m_colorin_bbox_min.y(),
+                      (corner & 4) ? m_colorin_bbox_max.z() : m_colorin_bbox_min.z());
+        const double z = (matrix * p).z();
+        z_min = std::min(z_min, z);
+        z_max = std::max(z_max, z);
+    }
+    const double z_height = z_max - z_min;
+    const double clip_min = std::max<double>(z_min, colorin_z_range[0]);
+    const double clip_max = std::min<double>(z_max, colorin_z_range[1]);
+    if (z_height <= EPSILON || clip_max <= clip_min + EPSILON)
+        return false;
+
+    const std::vector<ColorRGBA> &colors = m_colorin_gradients[color_idx - 1];
+    const float  alpha      = m_colors[color_idx - 1].a();
+    const size_t band_count = std::clamp<size_t>(colors.size() * 16, 24, 64);
+    for (size_t band_idx = 0; band_idx < band_count; ++band_idx) {
+        const double band_min = z_min + z_height * double(band_idx) / double(band_count);
+        const double band_max = z_min + z_height * double(band_idx + 1) / double(band_count);
+        const double draw_min = std::max<double>(band_min, clip_min);
+        const double draw_max = std::min<double>(band_max, clip_max);
+        if (draw_max <= draw_min + EPSILON)
+            continue;
+        ColorRGBA band_color = colorin_sample_gradient_color(colors, (double(band_idx) + 0.5) / double(band_count));
+        band_color.a(alpha);
+        shader->set_uniform("uniform_color", band_color);
+        shader->set_uniform("z_range", std::array<float, 2>{ float(draw_min), float(draw_max) });
+        m_gizmo_scene.render(color_idx);
+    }
+    shader->set_uniform("z_range", colorin_z_range);
+    return true;
+}
+
 void TriangleSelectorMmGui::update_render_data()
 {
+    // Prusa Colorin: model-space bounding box for the gradient bands.
+    m_colorin_bbox_valid = !m_vertices.empty();
+    if (m_colorin_bbox_valid) {
+        m_colorin_bbox_min = m_vertices.front().v.cast<double>();
+        m_colorin_bbox_max = m_colorin_bbox_min;
+        for (const Vertex &vr : m_vertices) {
+            const Vec3d v = vr.v.cast<double>();
+            m_colorin_bbox_min = m_colorin_bbox_min.cwiseMin(v);
+            m_colorin_bbox_max = m_colorin_bbox_max.cwiseMax(v);
+        }
+    }
     m_gizmo_scene.release_geometry();
     m_vertices.reserve(m_vertices.size() * 3);
     for (const Vertex &vr : m_vertices) {
