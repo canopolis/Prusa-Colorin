@@ -7,6 +7,10 @@
 
 #include "GLGizmoPainterBase.hpp"
 
+#include <array>
+#include <cfloat>
+#include <vector>
+
 #include "slic3r/GUI/I18N.hpp"
 
 namespace Slic3r::GUI {
@@ -77,13 +81,29 @@ public:
 
     void render(ImGuiWrapper* imgui, const Transform3d& matrix) override;
 
+    // Prusa Colorin (Orca FullSpectrum 0.9.18): gradient preview of mixed filaments, drawn in
+    // bands along world Z. colorin_z_range must hold the z_range uniform the caller has set.
+    void set_colorin_gradients(std::vector<std::vector<ColorRGBA>> gradients) { m_colorin_gradients = std::move(gradients); }
+    std::array<float, 2> colorin_z_range{ -FLT_MAX, FLT_MAX };
+
 private:
     void update_render_data();
+    bool colorin_render_gradient(size_t color_idx, const Transform3d& matrix);
+
+    std::vector<std::vector<ColorRGBA>> m_colorin_gradients;
+    Vec3d                               m_colorin_bbox_min{ Vec3d::Zero() };
+    Vec3d                               m_colorin_bbox_max{ Vec3d::Zero() };
+    bool                                m_colorin_bbox_valid{ false };
 
     const std::vector<ColorRGBA>&            m_colors;
     const ColorRGBA                          m_default_volume_color;
     GLMmSegmentationGizmo3DScene             m_gizmo_scene;
 };
+
+// Prusa Colorin (Orca FullSpectrum 0.9.18): paint colours = physical filaments + mixed filaments.
+size_t                              colorin_mixed_visible_cnt();
+std::vector<ColorRGBA>              colorin_paint_colors();
+std::vector<std::vector<ColorRGBA>> colorin_paint_gradients(size_t n_colors);
 
 class GLGizmoMmuSegmentation : public GLGizmoPainterBase
 {
