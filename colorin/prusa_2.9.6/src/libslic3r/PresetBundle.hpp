@@ -98,6 +98,9 @@ public:
     // Prusa Colorin (FullSpectrum): filamentos mezclados (virtuales), igual que Orca FullSpectrum 0.9.18.
     MixedFilamentManager        mixed_filaments;
     void                        sync_mixed_filament_definitions_to_project_config();
+    // Prusa Colorin (Orca 0.9.18): regenerate mixed filaments from the physical filament colours in cfg.
+    void                        sync_mixed_filaments_from_config(const DynamicPrintConfig &cfg);
+    std::string                 m_colorin_mixed_sync_signature;
 
     // There will be an entry for each system profile loaded, 
     // and the system profiles will point to the VendorProfile instances owned by PresetBundle::vendors.

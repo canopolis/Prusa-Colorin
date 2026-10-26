@@ -14,6 +14,7 @@
 #include "CustomParametersHandling.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <set>
 #include <fstream>
 #include <unordered_set>
@@ -2173,6 +2174,100 @@ void PresetBundle::sync_mixed_filament_definitions_to_project_config()
         opt->value = serialized;
     else
         this->project_config.set_key_value("mixed_filament_definitions", new ConfigOptionString(serialized));
+}
+
+// Prusa Colorin (Orca FullSpectrum 0.9.18): regenerate the mixed (virtual) filaments from the physical
+// filaments, as Orca does in update_multi_material_filament_presets(). PrusaSlicer keeps the per-extruder
+// filament colours / transmission distances / material ids in the Plater (full) config, so they are
+// passed in. Only project_config is written, so the print preset is never marked as modified.
+void PresetBundle::sync_mixed_filaments_from_config(const DynamicPrintConfig &cfg)
+{
+    if (printers.get_edited_preset().printer_technology() != ptFFF)
+        return;
+    const ConfigOptionStrings *color_opt = cfg.option<ConfigOptionStrings>("filament_colour");
+    if (color_opt == nullptr || color_opt->values.empty())
+        return;
+    const size_t num_filaments = color_opt->values.size();
+    const DynamicPrintConfig &print_cfg = this->prints.get_edited_preset().config;
+
+    auto get_mixed_bool = [this, &print_cfg](const std::string &key, bool fallback) {
+        if (const ConfigOptionBool *opt = this->project_config.option<ConfigOptionBool>(key))
+            return opt->value;
+        if (const ConfigOptionInt *opt = this->project_config.option<ConfigOptionInt>(key))
+            return opt->value != 0;
+        if (const ConfigOptionBool *opt = print_cfg.option<ConfigOptionBool>(key))
+            return opt->value;
+        if (const ConfigOptionInt *opt = print_cfg.option<ConfigOptionInt>(key))
+            return opt->value != 0;
+        return fallback;
+    };
+    auto get_mixed_float = [this, &print_cfg](const std::string &key, float fallback) {
+        if (this->project_config.has(key))
+            return float(this->project_config.opt_float(key));
+        if (print_cfg.has(key))
+            return float(print_cfg.opt_float(key));
+        return fallback;
+    };
+    auto get_mixed_string = [this, &print_cfg](const std::string &key) {
+        std::string project_value;
+        if (this->project_config.has(key))
+            project_value = this->project_config.opt_string(key);
+        if (!project_value.empty())
+            return project_value;
+        if (print_cfg.has(key)) {
+            const std::string print_value = print_cfg.opt_string(key);
+            if (!print_value.empty())
+                return print_value;
+        }
+        return project_value;
+    };
+
+    std::vector<double> physical_tds;
+    if (const ConfigOptionFloats *td_opt = cfg.option<ConfigOptionFloats>("filament_transmission_distance"))
+        physical_tds = td_opt->values;
+    physical_tds.resize(num_filaments, 0.0);
+    for (double &td : physical_tds)
+        if (!std::isfinite(td) || td <= 0.0)
+            td = 0.0;
+    std::vector<std::string> physical_material_ids;
+    if (const ConfigOptionStrings *id_opt = cfg.option<ConfigOptionStrings>("filament_full_spectrum_material_id"))
+        physical_material_ids = id_opt->values;
+    physical_material_ids.resize(num_filaments);
+
+    const bool  gradient_mode_on     = get_mixed_bool("mixed_filament_gradient_mode", false);
+    float       min_sublayer_height  = std::max(0.01f, get_mixed_float("mixed_filament_height_lower_bound", 0.06f));
+    float       nominal_layer_height = std::max(0.01f, print_cfg.has("layer_height") ? float(print_cfg.opt_float("layer_height")) : 0.2f);
+    const bool  advanced_dithering   = get_mixed_bool("mixed_filament_advanced_dithering", false);
+    const bool  component_bias       = get_mixed_bool("mixed_filament_component_bias_enabled", false);
+    const std::string definitions    = get_mixed_string("mixed_filament_definitions");
+
+    // Skip when nothing relevant changed (this is called on every Plater config change).
+    std::string signature;
+    for (const std::string &c : color_opt->values) signature += c + ";";
+    for (double td : physical_tds) signature += std::to_string(td) + ";";
+    for (const std::string &id : physical_material_ids) signature += id + ";";
+    signature += std::to_string(int(gradient_mode_on)) + "|" + std::to_string(min_sublayer_height) + "|" + std::to_string(nominal_layer_height) +
+                 "|" + std::to_string(int(advanced_dithering)) + "|" + std::to_string(int(component_bias)) + "|" + definitions;
+    if (signature == m_colorin_mixed_sync_signature)
+        return;
+    m_colorin_mixed_sync_signature = signature;
+
+    MixedFilamentDisplayContext context;
+    context.num_physical          = num_filaments;
+    context.physical_colors       = color_opt->values;
+    context.physical_tds          = physical_tds;
+    context.physical_material_ids = physical_material_ids;
+    context.preview_settings.nominal_layer_height = nominal_layer_height;
+    context.preview_settings.min_sublayer_height  = min_sublayer_height;
+    context.component_bias_enabled = component_bias;
+    this->mixed_filaments.set_display_context(context);
+
+    this->mixed_filaments.auto_generate(color_opt->values);
+    this->mixed_filaments.clear_custom_entries();
+    this->mixed_filaments.load_custom_entries(definitions, color_opt->values);
+    this->mixed_filaments.apply_gradient_settings(gradient_mode_on ? 1 : 0, nominal_layer_height, min_sublayer_height, advanced_dithering);
+
+    this->sync_mixed_filament_definitions_to_project_config();
 }
 
 } // namespace Slic3r
