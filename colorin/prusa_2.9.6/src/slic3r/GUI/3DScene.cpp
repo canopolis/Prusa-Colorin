@@ -2865,7 +2865,7 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType type, bool disab
     // default extruder idx and timestamp of the painted data. The data belonging to objects
     // // which no longer exist are removed from the cache periodically.
     const ModelObjectPtrs& model_objects = GUI::wxGetApp().model().objects;
-    const std::vector<ColorRGBA> extruders_colors = GUI::wxGetApp().plater()->get_extruder_colors_from_plater_config();
+    const std::vector<ColorRGBA> extruders_colors = GUI::colorin_paint_colors(); // Prusa Colorin: physical + mixed filaments (Orca 0.9.18)
     const bool is_render_as_mmu_painted_enabled = !model_objects.empty() && !extruders_colors.empty();
 
     if (m_mm_paint_cache.extruders_colors != extruders_colors) {
@@ -2929,8 +2929,11 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType type, bool disab
             const int physical_cnt          = GUI::wxGetApp().extruders_edited_cnt();
             const FullSpectrum::VirtualExtruders& virtual_extruders =
                 model_objects[obj_idx]->get_model()->virtual_extruders;
-            const size_t extruder_idx =
+            size_t extruder_idx =
                 GUI::get_extruder_color_idx(model_volume, physical_cnt, virtual_extruders);
+            if (GUI::colorin_mixed_visible_cnt() > 0) // Prusa Colorin: base colour = volume filament (physical or mixed)
+                extruder_idx = size_t(std::max(model_volume.extruder_id(), 1) - 1);
+            extruder_idx = std::min(extruder_idx, m_mm_paint_cache.extruders_colors.size() - 1);
 
             // This block retrieves the painted geometry from the cache or adds it to it.
             ObjectID vol_id = model_volume.id();
@@ -2942,6 +2945,7 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType type, bool disab
                 ts = ts_uptr.get();
                 ts->deserialize(model_volume.mm_segmentation_facets.get_data(), true);
                 ts->request_update_render_data();
+                ts->set_colorin_gradients(GUI::colorin_paint_gradients(m_mm_paint_cache.extruders_colors.size())); // Prusa Colorin
                 m_mm_paint_cache.volume_data[vol_id] = MMPaintCachePerVolume{ extruder_idx, std::move(ts_uptr), std::chrono::system_clock::now(), timestamp };
             }
             else {
@@ -2950,6 +2954,7 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType type, bool disab
             }
 
             
+            ts->colorin_z_range = z_range; // Prusa Colorin: same z_range uniform set above
             ts->render(nullptr, world_matrix);
 
             if (is_left_handed)
