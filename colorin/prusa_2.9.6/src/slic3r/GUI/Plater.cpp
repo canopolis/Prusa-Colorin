@@ -7117,6 +7117,10 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
         }
     }
 
+    // Prusa Colorin (Orca FullSpectrum 0.9.18): keep the mixed (virtual) filaments in sync with the
+    // physical filament colours, transmission distances and material ids (skipped when unchanged).
+    wxGetApp().preset_bundle->sync_mixed_filaments_from_config(*p->config);
+
     if (bed_shape_changed)
         set_bed_shape();
 
