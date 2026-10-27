@@ -288,6 +288,53 @@ private:
     size_t                                      m_ref_cnt{ 0 };
 };
 
+// Prusa Colorin (Orca FullSpectrum v0.9.18 Print.hpp 62-106)
+// Phase A local-Z dithering planner cache.
+struct LocalZInterval
+{
+    size_t layer_id { 0 };
+    double z_lo { 0.0 };
+    double z_hi { 0.0 };
+    double base_height { 0.0 };
+    double sublayer_height { 0.0 };
+    bool   has_mixed_paint { false };
+    bool   independent_layer_height { false };
+    size_t first_sublayer_idx { 0 };
+    size_t sublayer_count { 0 };
+    ExPolygons managed_masks;
+};
+
+struct SubLayerPlan
+{
+    size_t layer_id { 0 };
+    size_t pass_index { 0 };
+    bool   split_interval { false };
+    bool   external_perimeters_only { false };
+    double z_lo { 0.0 };
+    double z_hi { 0.0 };
+    double print_z { 0.0 };
+    double flow_height { 0.0 };
+    size_t dependency_group { 0 };
+    size_t dependency_order { 0 };
+    // Adaptive Local-Z keeps the authored XY perimeter and uses this pass
+    // metadata to derive a continuously varying physical Z and bead height at
+    // G-code time. Other Local-Z modes remain ordinary constant-Z sublayers.
+    bool                      adaptive_nonplanar { false };
+    size_t                    adaptive_component_index { 0 };
+    std::vector<unsigned int> adaptive_component_ids;
+    std::vector<int>          adaptive_component_weights;
+    // A strict N-component adaptive cadence owns N nominal layer heights.
+    // Every component is emitted once, on successive nominal layers, while
+    // these bounds keep all locally varying component thicknesses on the same
+    // fixed-height cadence cycle.
+    double                    adaptive_cycle_z_lo { 0.0 };
+    double                    adaptive_cycle_z_hi { 0.0 };
+    double                    adaptive_sample_z { 0.0 };
+    std::vector<ExPolygons> painted_masks_by_extruder;
+    std::vector<ExPolygons> fixed_painted_masks_by_extruder;
+    ExPolygons              base_masks;
+};
+
 class PrintObject : public PrintObjectBaseWithState<Print, PrintObjectStep, posCount>
 {
 private: // Prevents erroneous use by other classes.
@@ -367,6 +414,19 @@ public:
     //FIXME returing all possible regions before slicing, thus some of the regions may not be slicing at the end.
     std::vector<std::reference_wrapper<const PrintRegion>> all_regions() const;
     const PrintObjectRegions*   shared_regions() const throw() { return m_shared_regions; }
+    // Prusa Colorin Local-Z (Orca 0.9.18)
+    const std::vector<LocalZInterval>& local_z_intervals() const { return m_local_z_intervals; }
+    const std::vector<SubLayerPlan>&   local_z_sublayer_plan() const { return m_local_z_sublayer_plan; }
+    void                                set_local_z_plan(std::vector<LocalZInterval> intervals, std::vector<SubLayerPlan> sublayers)
+    {
+        m_local_z_intervals = std::move(intervals);
+        m_local_z_sublayer_plan = std::move(sublayers);
+    }
+    void                                clear_local_z_plan()
+    {
+        m_local_z_intervals.clear();
+        m_local_z_sublayer_plan.clear();
+    }
 
     bool                        has_support()           const { return m_config.support_material || m_config.support_material_enforce_layers > 0; }
     bool                        has_raft()              const { return m_config.raft_layers > 0; }
@@ -465,6 +525,9 @@ private:
     // Object split into layer ranges and regions with their associated configurations.
     // Shared among PrintObjects created for the same ModelObject.
     PrintObjectRegions                     *m_shared_regions { nullptr };
+    // Prusa Colorin Local-Z (Orca 0.9.18)
+    std::vector<LocalZInterval>             m_local_z_intervals;
+    std::vector<SubLayerPlan>               m_local_z_sublayer_plan;
 
     SlicingParameters                       m_slicing_params;
     LayerPtrs                               m_layers;
