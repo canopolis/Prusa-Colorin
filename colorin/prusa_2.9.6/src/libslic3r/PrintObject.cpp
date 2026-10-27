@@ -174,6 +174,24 @@ std::vector<std::reference_wrapper<const PrintRegion>> PrintObject::all_regions(
 // 2) Increases an "extra perimeters" counter at region slices where needed.
 // 3) Generates perimeters, gap fills and fill regions (fill regions of type stInternal).
 
+// Prusa Colorin: tras el respaldo de perimetros, Layer::make_perimeters() ya reconstruyo slices, lslices y
+// lslices_ex (con sus perimetros). Aqui solo se rehace el grafo entre capas, sin borrar las islas.
+static void colorin_rebuild_layer_graph(PrintObject &object, std::vector<Layer*> &layers)
+{
+    (void)object;
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, layers.size()), [&layers](const tbb::blocked_range<size_t> &range) {
+        for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++layer_idx)
+            for (LayerSlice &lslice : layers[layer_idx]->lslices_ex) {
+                lslice.overlaps_above.clear();
+                lslice.overlaps_below.clear();
+            }
+    });
+    tbb::parallel_for(tbb::blocked_range<size_t>(1, layers.size()), [&layers](const tbb::blocked_range<size_t> &range) {
+        for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++layer_idx)
+            Layer::build_up_down_graph(*layers[layer_idx - 1], *layers[layer_idx]);
+    });
+}
+
 // Prusa Colorin (Orca 0.9.18 ImageMap): reconstruir las islas de capa (lslices_ex) y el grafo entre capas
 // despues de que el renderer de perimetros por imagen modifique las slices, igual que PrintObject::slice().
 static void colorin_rebuild_layer_islands(PrintObject &object, std::vector<Layer*> &layers)
@@ -339,18 +357,15 @@ void PrintObject::make_perimeters()
             for (LayerRegion* region : layer->regions()) {
                 if (!region->image_map_has_perimeter_fallback_slices)
                     continue;
-                region->m_slices   = std::move(region->image_map_perimeter_fallback_slices);
-                region->raw_slices = to_expolygons(region->m_slices.surfaces);
                 region->image_map_has_perimeter_fallback_slices = false;
                 layer_changed = true;
             }
             if (layer_changed) {
-                layer->make_slices();
                 any_fallback = true;
             }
         }
         if (any_fallback)
-            colorin_rebuild_layer_islands(*this, m_layers);
+            colorin_rebuild_layer_graph(*this, m_layers);
     }
     BOOST_LOG_TRIVIAL(debug) << "Generating perimeters in parallel - end";
 

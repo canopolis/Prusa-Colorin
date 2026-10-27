@@ -86,6 +86,8 @@ public:
     bool                        image_map_adaptive_perimeter_island{false};
     SurfaceCollection           image_map_perimeter_fallback_slices;
     bool                        image_map_has_perimeter_fallback_slices{false};
+    // Prusa Colorin: modo de perimetro elegido al aplicar el respaldo (-1 ninguno, 0 normal, 1 textura).
+    int                         colorin_perimeter_fallback_mode { -1 };
 
     [[nodiscard]] const SurfaceCollection&          slices() const { return m_slices; }
 
@@ -138,7 +140,9 @@ public:
         // All fill areas produced for all input slices above.
         ExPolygons                                             &fill_expolygons,
         // Ranges of fill areas above per input slice.
-        std::vector<ExPolygonRange>                            &fill_expolygons_ranges);
+        std::vector<ExPolygonRange>                            &fill_expolygons_ranges,
+        // Prusa Colorin: regiones compatibles fusionadas (Orca compatible_regions).
+        const std::vector<const LayerRegion*>                  *colorin_compatible_regions = nullptr);
     void    process_external_surfaces(const Layer *lower_layer, const Polygons *lower_layer_covered);
     double  infill_area_threshold() const;
     // Trim surfaces by trimming polygons. Used by the elephant foot compensation at the 1st layer.
