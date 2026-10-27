@@ -1332,6 +1332,54 @@ void Plater::notify_about_installed_presets()
     }
 }
 
+// Prusa Colorin (Orca FullSpectrum 0.9.18): copy the mixed-filament project keys of an imported 3MF
+// (Metadata/Slic3r_PE.config) into the project config, as Orca does when importing a 3MF project.
+static void colorin_import_mixed_filaments_from_3mf(const std::string &filename, Plater *plater)
+{
+    mz_zip_archive archive;
+    mz_zip_zero_struct(&archive);
+    if (!open_zip_reader(&archive, filename))
+        return;
+    std::string buffer;
+    const int index = mz_zip_reader_locate_file(&archive, "Metadata/Slic3r_PE.config", nullptr, 0);
+    mz_zip_archive_file_stat stat;
+    if (index >= 0 && mz_zip_reader_file_stat(&archive, mz_uint(index), &stat) && stat.m_uncomp_size > 0) {
+        buffer.assign(size_t(stat.m_uncomp_size), 0);
+        if (!mz_zip_reader_extract_to_mem(&archive, mz_uint(index), (void*)buffer.data(), buffer.size(), 0))
+            buffer.clear();
+    }
+    close_zip_reader(&archive);
+    if (buffer.empty())
+        return;
+
+    DynamicPrintConfig loaded;
+    ConfigSubstitutionContext substitutions{ ForwardCompatibilitySubstitutionRule::Enable };
+    try {
+        ConfigBase::load_from_gcode_string_legacy(loaded, buffer.data(), substitutions);
+    } catch (const std::exception &e) {
+        BOOST_LOG_TRIVIAL(warning) << "Prusa Colorin: mixed filaments not imported from 3MF: " << e.what();
+        return;
+    }
+    const ConfigOptionString *definitions = loaded.option<ConfigOptionString>("mixed_filament_definitions");
+    if (definitions == nullptr || definitions->value.empty())
+        return;
+
+    DynamicPrintConfig &project = wxGetApp().preset_bundle->project_config;
+    size_t copied = 0;
+    for (const std::string &key : loaded.keys()) {
+        if (!boost::algorithm::starts_with(key, "mixed_") && !boost::algorithm::starts_with(key, "dithering_") &&
+            !boost::algorithm::starts_with(key, "local_z_"))
+            continue;
+        if (const ConfigOption *opt = loaded.option(key)) {
+            project.set_key_value(key, opt->clone());
+            ++copied;
+        }
+    }
+    BOOST_LOG_TRIVIAL(info) << "Prusa Colorin: imported mixed-filament project keys from 3MF, keys=" << copied;
+    if (copied > 0 && plater != nullptr)
+        plater->on_config_change(project);
+}
+
 std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_files, bool load_model, bool load_config, bool imperial_units/* = false*/)
 {
     if (input_files.empty()) { return std::vector<size_t>(); }
@@ -1530,6 +1578,12 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
             GUI::show_error(q, e.what());
             continue;
         }
+
+        // Prusa Colorin (Orca FullSpectrum 0.9.18): Orca imports a 3MF together with its project settings,
+        // so the mixed (virtual) filaments travel with the model. PrusaSlicer "Import" loads geometry only;
+        // bring over the mixed_* / dithering_* / local_z_* project keys so the image-map palette resolves.
+        if (type_3mf && load_model && !load_config)
+            colorin_import_mixed_filaments_from_3mf(path.string(), q);
 
         if (load_config) {
 
