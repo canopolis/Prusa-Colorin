@@ -27,7 +27,39 @@
 #include <vector>
 
 // Prusa Colorin: Orca define is_external_perimeter(role) como funcion libre; en Prusa es miembro de ExtrusionRole.
-namespace Slic3r { static inline bool is_external_perimeter(ExtrusionRole role) { return role.is_external_perimeter(); } }
+namespace Slic3r {
+static inline bool is_external_perimeter(ExtrusionRole role) { return role.is_external_perimeter(); }
+// Prusa Colorin: copia de Orca ExPolygon.cpp projection_onto(ExPolygons, Point) (Prusa no tiene Point::projection_onto).
+static Point projection_onto(const ExPolygons& polygons, const Point& from)
+{
+    Point  projected_pt;
+    double min_dist = std::numeric_limits<double>::max();
+    const Vec2d f = from.cast<double>();
+    auto visit = [&](const Polygon& poly) {
+        const Points& p = poly.points;
+        const size_t  n = p.size();
+        for (size_t i = 0; i < n; ++i) {
+            const Vec2d  a   = p[i].cast<double>();
+            const Vec2d  b   = p[(i + 1) % n].cast<double>();
+            const Vec2d  ab  = b - a;
+            const double len = ab.squaredNorm();
+            const double t   = len > 0. ? std::clamp((f - a).dot(ab) / len, 0., 1.) : 0.;
+            const Vec2d  q   = a + t * ab;
+            const double d   = (f - q).squaredNorm();
+            if (d < min_dist) {
+                min_dist     = d;
+                projected_pt = Point(coord_t(std::llround(q.x())), coord_t(std::llround(q.y())));
+            }
+        }
+    };
+    for (const ExPolygon& expoly : polygons) {
+        visit(expoly.contour);
+        for (const Polygon& hole : expoly.holes)
+            visit(hole);
+    }
+    return projected_pt;
+}
+}
 
 namespace Slic3r::ImageMap {
 namespace {
@@ -1563,10 +1595,20 @@ struct PerimeterEnvelopeRenderer::Impl
                                                                 apply_path_displacement,
                                                                 use_carrier_width);
                     if (path_changed) {
-                        auto* replacement      = new ExtrusionMultiPath();
-                        replacement->paths     = std::move(modulated);
-                        if (!path->can_reverse())
-                            replacement->set_reverse();
+                        ExtrusionEntity* replacement = nullptr;
+                        if (path->can_reverse()) {
+                            auto* multipath  = new ExtrusionMultiPath();
+                            multipath->paths = std::move(modulated);
+                            replacement      = multipath;
+                        } else {
+                            // Prusa Colorin: Prusa no tiene ExtrusionMultiPath::set_reverse(); se conserva la orientacion
+                            // con una coleccion sin reordenar de ExtrusionPathOriented.
+                            auto* oriented    = new ExtrusionEntityCollection();
+                            oriented->no_sort = true;
+                            for (ExtrusionPath& segment : modulated)
+                                oriented->entities.emplace_back(new ExtrusionPathOriented(std::move(segment.polyline), segment.attributes()));
+                            replacement = oriented;
+                        }
                         delete child;
                         child   = replacement;
                         changed = true;
@@ -2228,7 +2270,7 @@ bool PerimeterEnvelopeRenderer::apply_to_slices(Layer& layer) const
             // material interface and create either overlap or a gap.
             for (RegionGeometry &item : region_geometries) {
                 ExPolygons clipped = intersection_ex(item.geometry, modulated_envelope, ApplySafetyOffset::No);
-                item.const_cast<SurfaceCollection&>(region->slices()).set(clipped, stInternal);
+                const_cast<SurfaceCollection&>(item.region->slices()).set(clipped, stInternal);
                 item.region->raw_slices = std::move(clipped);
                 const unsigned int filament_id = unsigned(std::max(0, item.region->region().config().perimeter_extruder.value));
                 if (m_impl->adaptive_island_filament_ids.count(filament_id) != 0) {
