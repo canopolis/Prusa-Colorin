@@ -2280,7 +2280,11 @@ bool PerimeterEnvelopeRenderer::apply_to_slices(Layer& layer) const
             }
             if (mapped) {
                 layer.make_slices();
-                // Prusa Colorin: Prusa no tiene lslices_bboxes (usa lslices_ex, se reconstruye despues).
+                // Prusa Colorin: equivalente Prusa de lslices_bboxes de Orca (el grafo entre capas lo rehace PrintObject).
+                layer.lslices_ex.clear();
+                layer.lslices_ex.reserve(layer.lslices.size());
+                for (const ExPolygon& expolygon : layer.lslices)
+                    layer.lslices_ex.push_back({ get_extents(expolygon) });
             }
             return result.changed || mapped;
         }
@@ -2338,7 +2342,11 @@ bool PerimeterEnvelopeRenderer::apply_to_slices(Layer& layer) const
 
     if (any_mapping) {
         layer.make_slices();
-                // Prusa Colorin: Prusa no tiene lslices_bboxes (usa lslices_ex, se reconstruye despues).
+                // Prusa Colorin: equivalente Prusa de lslices_bboxes de Orca (el grafo entre capas lo rehace PrintObject).
+                layer.lslices_ex.clear();
+                layer.lslices_ex.reserve(layer.lslices.size());
+                for (const ExPolygon& expolygon : layer.lslices)
+                    layer.lslices_ex.push_back({ get_extents(expolygon) });
     }
     return changed || any_mapping;
 }
