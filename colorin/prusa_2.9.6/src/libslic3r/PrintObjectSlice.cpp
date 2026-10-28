@@ -4811,7 +4811,12 @@ static void colorin_resolve_mixed_channels(const PrintObject &print_object, std:
                     if (!collapse_enabled || (definition &&
                         (mixed_filament_definition_uses_local_z(*definition, local_z_mode) ||
                          definition->behavior.surface_bias.perimeter_modulation)))
-                        ++pending_feature_channels;
+                        {
+                    // Prusa Colorin 4c-3b (Orca 0.9.18 PrintObjectSlice 4687-4705): keep the mixed channel as its
+                    // own region; ToolOrdering / G-code resolve it to a physical tool per layer.
+                    ++pending_feature_channels;
+                    continue;
+                }
                     const unsigned int physical_id = mixed_mgr.effective_painted_region_filament_id(
                         channel_id, num_physical, int(layer_id), float(layer.print_z), float(layer.height),
                         preferred_a, preferred_b, base_height);
@@ -4831,8 +4836,8 @@ static void colorin_resolve_mixed_channels(const PrintObject &print_object, std:
                             << " physical_filaments=" << num_physical
                             << " total_filaments=" << mixed_mgr.total_filaments(num_physical);
     if (pending_feature_channels.load() > 0)
-        BOOST_LOG_TRIVIAL(warning) << "Prusa Colorin: Local-Z / perimeter modulation / collapse-off channels resolved with the"
-                                   << " layer cadence until phases 4b-4 and 4c are ported"
+        BOOST_LOG_TRIVIAL(warning) << "Prusa Colorin: Local-Z / perimeter modulation / collapse-off channels kept as mixed regions"
+                                   << " (resolved per layer in ToolOrdering)"
                                    << " layer_channels=" << pending_feature_channels.load();
 }
 
@@ -4900,10 +4905,14 @@ void apply_mm_segmentation(PrintObject &print_object, ThrowOnCancel throw_on_can
                 it_layer_range = layer_range_next(layer_ranges, it_layer_range, layer.slice_z);
                 const PrintObjectRegions::LayerRangeRegions &layer_range = *it_layer_range;
                 // Gather per extruder expolygons.
-                by_extruder.assign(num_extruders, ByExtruder());
+                // Prusa Colorin 4c-3b: kept mixed channels live after the physical ones.
+                const size_t layer_channels = std::max(num_extruders, segmentation[layer_id].size());
+                by_extruder.assign(layer_channels, ByExtruder());
                 by_region.assign(layer.region_count(), ByRegion());
                 bool layer_split = false;
-                for (size_t extruder_id = 0; extruder_id < num_extruders; ++ extruder_id) {
+                for (size_t extruder_id = 0; extruder_id < layer_channels; ++ extruder_id) {
+                    if (extruder_id >= segmentation[layer_id].size())
+                        break;
                     ByExtruder &region = by_extruder[extruder_id];
                     append(region.expolygons, std::move(segmentation[layer_id][extruder_id]));
                     if (! region.expolygons.empty()) {
@@ -4956,6 +4965,10 @@ void apply_mm_segmentation(PrintObject &print_object, ThrowOnCancel throw_on_can
 
                         assert(it_target_region != layer_range.painted_regions.end());
                         assert(layer_range.volume_regions[it_target_region->parent].region == &parent_print_region && int(it_target_region->extruder_id) == extruder_id);
+                        // Prusa Colorin 4c-3b: never dereference a missing painted region (release builds skip the asserts).
+                        if (it_target_region == layer_range.painted_regions.cend() || int(it_target_region->extruder_id) != extruder_id ||
+                            layer_range.volume_regions[it_target_region->parent].region != &parent_print_region)
+                            continue;
 
                         // Update the beginning PaintedRegion iterator for the next iteration.
                         it_painted_region_begin = it_target_region;
