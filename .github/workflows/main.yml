@@ -81,6 +81,10 @@ jobs:
           # Archivos de PrusaSlicer 2.9.6 ya modificados para el motor de color.
           Copy-Item -Recurse -Force "$env:GITHUB_WORKSPACE\colorin\prusa_2.9.6\src\*" "C:\ps\src\"
           Copy-Item -Force "$env:GITHUB_WORKSPACE\colorin\prusa_2.9.6\CMakeLists.txt" "C:\ps\CMakeLists.txt"
+          # Numero de compilacion en el titulo de la ventana (en vez de "+UNKNOWN").
+          $vi = "C:\ps\version.inc"
+          (Get-Content $vi) -replace 'set\(SLIC3R_BUILD_ID .*\)', ('set(SLIC3R_BUILD_ID "Prusa Colorin #' + $env:GITHUB_RUN_NUMBER + '")') | Set-Content $vi
+          Select-String -Path $vi -Pattern "SLIC3R_BUILD_ID"
           Get-ChildItem "$env:GITHUB_WORKSPACE\colorin\prusa_2.9.6" -Recurse -File | ForEach-Object { Write-Host "Reemplazado: $($_.Name)" }
 
       - name: Compilar librerias (solo si no estan guardadas)
