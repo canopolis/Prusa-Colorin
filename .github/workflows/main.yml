@@ -245,6 +245,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $pkg | Out-Null
           Copy-Item -Path $files.FullName -Destination $pkg -Force
           Copy-Item -Recurse -Force "C:\ps\resources" "$pkg\resources"
+          # Prusa Colorin: lanzador con log dentro del portable.
+          Copy-Item -Force "$env:GITHUB_WORKSPACE\colorin\iniciar_con_log.bat" "$pkg\iniciar_con_log.bat"
           Write-Host "Archivos en el portable: $((Get-ChildItem $pkg -Recurse -File).Count)"
           Compress-Archive -Path "$pkg\*" -DestinationPath "PrusaColorin-portable.zip"
 
