@@ -94,6 +94,42 @@ bool LayerTools::is_extruder_order(unsigned int a, unsigned int b) const
     return false;
 }
 
+// Prusa Colorin (Orca 0.9.18 GCode/ToolOrdering.cpp 67-142): grouped manual patterns give each perimeter its own tool.
+static unsigned int colorin_grouped_pattern_id(const MixedFilamentManager *mixed_mgr, size_t num_physical, unsigned int filament_id_1based)
+{
+    if (mixed_mgr == nullptr || filament_id_1based <= num_physical || !mixed_mgr->is_mixed(filament_id_1based, num_physical))
+        return 0;
+    const std::optional<MixedFilamentDefinition> definition = mixed_mgr->mixed_filament_definition_from_id(filament_id_1based, num_physical);
+    return (definition && definition->recipe.manual_pattern && definition->recipe.manual_pattern->groups.size() > 1) ? filament_id_1based : 0;
+}
+
+// Prusa Colorin: Prusa keeps the wall index in ExtrusionAttributes::perimeter_index (0 = external), Orca in inset_idx.
+static int colorin_entity_perimeter_index(const ExtrusionEntity &entity)
+{
+    const ExtrusionPath *path = dynamic_cast<const ExtrusionPath*>(&entity);
+    if (path == nullptr) {
+        if (const auto *loop = dynamic_cast<const ExtrusionLoop*>(&entity); loop != nullptr && !loop->paths.empty())
+            path = &loop->paths.front();
+        else if (const auto *multi = dynamic_cast<const ExtrusionMultiPath*>(&entity); multi != nullptr && !multi->paths.empty())
+            path = &multi->paths.front();
+        else if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection*>(&entity);
+                 collection != nullptr && !collection->entities.empty() && collection->entities.front() != nullptr)
+            return colorin_entity_perimeter_index(*collection->entities.front());
+    }
+    if (path != nullptr && path->attributes().perimeter_index)
+        return int(*path->attributes().perimeter_index);
+    return entity.role().is_external_perimeter() ? 0 : 1;
+}
+
+static unsigned int colorin_grouped_infill_extruder_1based(const LayerTools &lt, const PrintRegion &region, unsigned int filament_id_1based)
+{
+    if (colorin_grouped_pattern_id(lt.colorin_mixed_mgr, lt.colorin_num_physical, filament_id_1based) == 0)
+        return 0;
+    const unsigned int resolved = lt.colorin_mixed_mgr->resolve_perimeter(filament_id_1based, lt.colorin_num_physical, lt.colorin_layer_index,
+        std::max(0, region.config().perimeters.value - 1), float(lt.print_z), lt.colorin_layer_height);
+    return (resolved >= 1 && resolved <= lt.colorin_num_physical) ? resolved : 0;
+}
+
 // Return a zero based extruder from the region, or extruder_override if overriden.
 unsigned int LayerTools::perimeter_extruder(const PrintRegion &region) const
 {
@@ -104,13 +140,19 @@ unsigned int LayerTools::perimeter_extruder(const PrintRegion &region) const
 unsigned int LayerTools::infill_extruder(const PrintRegion &region) const
 {
 	assert(region.config().infill_extruder.value > 0);
-	return this->colorin_resolve_mixed_1based((this->extruder_override == 0) ? region.config().infill_extruder.value : this->extruder_override) - 1;
+	const unsigned int colorin_id = (this->extruder_override == 0) ? region.config().infill_extruder.value : this->extruder_override;
+    if (const unsigned int grouped = colorin_grouped_infill_extruder_1based(*this, region, colorin_id); grouped != 0)
+        return grouped - 1; // Prusa Colorin: grouped pattern infill follows the innermost wall tool (Orca 0.9.18)
+    return this->colorin_resolve_mixed_1based(colorin_id) - 1;
 }
 
 unsigned int LayerTools::solid_infill_extruder(const PrintRegion &region) const
 {
 	assert(region.config().solid_infill_extruder.value > 0);
-	return this->colorin_resolve_mixed_1based((this->extruder_override == 0) ? region.config().solid_infill_extruder.value : this->extruder_override) - 1;
+	const unsigned int colorin_id = (this->extruder_override == 0) ? region.config().solid_infill_extruder.value : this->extruder_override;
+    if (const unsigned int grouped = colorin_grouped_infill_extruder_1based(*this, region, colorin_id); grouped != 0)
+        return grouped - 1; // Prusa Colorin: grouped pattern infill follows the innermost wall tool (Orca 0.9.18)
+    return this->colorin_resolve_mixed_1based(colorin_id) - 1;
 }
 
 // Returns a zero based extruder this eec should be printed with, according to PrintRegion config or extruder_override if overriden.
@@ -125,7 +167,20 @@ unsigned int LayerTools::extruder(const ExtrusionEntityCollection &extrusions, c
 	    	(extrusions.entities.front()->role().is_solid_infill() ? region.config().solid_infill_extruder : region.config().infill_extruder) :
 			region.config().perimeter_extruder.value) :
 		this->extruder_override;
-	extruder = this->colorin_resolve_mixed_1based(extruder); // Prusa Colorin (FullSpectrum)
+	if (this->extruder_override == 0) {
+        if (extrusions.role().is_infill())
+            return extrusions.entities.front()->role().is_solid_infill() ? this->solid_infill_extruder(region) : this->infill_extruder(region);
+        // Prusa Colorin (Orca 0.9.18 GCode.cpp 4062-4106): grouped manual pattern, tool chosen per wall index.
+        if (colorin_grouped_pattern_id(this->colorin_mixed_mgr, this->colorin_num_physical, extruder) != 0) {
+            const int perimeter_index = (extrusions.entities.empty() || extrusions.entities.front() == nullptr) ? 0 :
+                colorin_entity_perimeter_index(*extrusions.entities.front());
+            const unsigned int resolved = this->colorin_mixed_mgr->resolve_perimeter(extruder, this->colorin_num_physical,
+                this->colorin_layer_index, perimeter_index, float(this->print_z), this->colorin_layer_height);
+            if (resolved >= 1 && resolved <= this->colorin_num_physical)
+                return resolved - 1;
+        }
+    }
+    extruder = this->colorin_resolve_mixed_1based(extruder); // Prusa Colorin (FullSpectrum)
 	return (extruder == 0) ? 0 : extruder - 1;
 }
 
@@ -266,6 +321,10 @@ void ToolOrdering::initialize_layers(std::vector<coordf_t> &zs)
 // Decides whether this entity could be overridden
 [[nodiscard]] static bool is_overriddable(const ExtrusionEntityCollection& eec, const LayerTools& lt, const PrintConfig& print_config, const PrintObject& object, const PrintRegion& region)
 {
+    // Prusa Colorin: walls of a grouped manual pattern keep their per-wall tools, never used for wiping.
+    if (lt.extruder_override == 0 && eec.role().is_perimeter() &&
+        colorin_grouped_pattern_id(lt.colorin_mixed_mgr, lt.colorin_num_physical, unsigned(std::max(0, region.config().perimeter_extruder.value))) != 0)
+        return false;
     if (print_config.filament_soluble.get_at(lt.extruder(eec, region)))
         return false;
 
@@ -354,7 +413,20 @@ void ToolOrdering::collect_extruders(
                 }
 
                 if (something_nonoverriddable)
-               		layer_tools.extruders.emplace_back(layer_tools.colorin_resolve_mixed_1based(extruder_override == 0 ? region.config().perimeter_extruder.value : extruder_override));
+               		{
+                    // Prusa Colorin (Orca 0.9.18 ToolOrdering.cpp 760-795): a grouped manual pattern needs every wall tool on this layer.
+                    const unsigned int colorin_wall = extruder_override == 0 ? unsigned(region.config().perimeter_extruder.value) : unsigned(extruder_override);
+                    std::vector<unsigned int> colorin_ordered;
+                    if (colorin_grouped_pattern_id(layer_tools.colorin_mixed_mgr, layer_tools.colorin_num_physical, colorin_wall) != 0)
+                        colorin_ordered = layer_tools.colorin_mixed_mgr->ordered_perimeter_extruders(colorin_wall, layer_tools.colorin_num_physical,
+                            layer_tools.colorin_layer_index, float(layer_tools.print_z), layer_tools.colorin_layer_height);
+                    if (colorin_ordered.empty())
+                        layer_tools.extruders.emplace_back(layer_tools.colorin_resolve_mixed_1based(colorin_wall));
+                    else
+                        for (const unsigned int colorin_extruder : colorin_ordered)
+                            if (colorin_extruder >= 1 && colorin_extruder <= layer_tools.colorin_num_physical)
+                                layer_tools.extruders.emplace_back(colorin_extruder);
+                }
 
                 layer_tools.has_object = true;
             }
