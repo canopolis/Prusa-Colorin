@@ -3553,7 +3553,6 @@ static void build_local_z_plan(PrintObject &print_object,
         throw_on_cancel();
 
         const Layer &layer = *print_object.get_layer(int(layer_id));
-        BOOST_LOG_TRIVIAL(warning) << "Colorin LZ diag layer_begin layer_id=" << layer_id << " channels=" << (layer_id < segmentation.size() ? segmentation[layer_id].size() : size_t(0)) << " layer_count=" << print_object.layer_count() << " seg_size=" << segmentation.size();
         LocalZInterval interval;
         interval.layer_id           = layer_id;
         interval.z_lo               = layer.print_z - layer.height;
@@ -4739,17 +4738,15 @@ static void build_local_z_plan(PrintObject &print_object,
                                      << " base_mask_count=" << base_masks.size();
         }
 
-        BOOST_LOG_TRIVIAL(warning) << "Colorin LZ diag layer_end layer_id=" << layer_id << " plans=" << plans.size();
         row_active_prev_layer = row_active_this_layer;
         intervals.emplace_back(std::move(interval));
     }
-    BOOST_LOG_TRIVIAL(warning) << "Colorin LZ diag loop_done intervals=" << intervals.size() << " plans=" << plans.size();
 
     if (!intervals.empty() && !plans.empty()) {
         print_object.set_local_z_plan(std::move(intervals), std::move(plans));
-        BOOST_LOG_TRIVIAL(warning) << "Colorin LZ diag plan_set";
-        export_local_z_plan_debug(print_object, min_sublayer_height);
-        BOOST_LOG_TRIVIAL(warning) << "Colorin LZ diag export_done";
+        // Prusa Colorin: Orca debug JSON dump (debug_out_path "out/") disabled - it crashed PrusaSlicer 2.9.6
+        // right after the Local-Z plan was stored (diagnostic build #102). It only wrote a debug file.
+        // export_local_z_plan_debug(print_object, min_sublayer_height);
         BOOST_LOG_TRIVIAL(warning) << "Local-Z plan built"
                                    << " object=" << object_name
                                    << " mixed_intervals=" << mixed_intervals
@@ -4881,11 +4878,8 @@ void apply_mm_segmentation(PrintObject &print_object, ThrowOnCancel throw_on_can
         std::vector<std::vector<ExPolygons>> local_z_segmentation =
             local_z_planner_segmentation_with_whole_object_mixed_wall(print_object, segmentation, lz_enabled_rows, has_whole_object_local_z_scope);
         build_local_z_plan(print_object, local_z_segmentation, has_whole_object_local_z_scope, lz_enabled_rows, lz_adaptive_independent_rows, throw_on_cancel);
-        BOOST_LOG_TRIVIAL(warning) << "Colorin LZ diag build_plan_returned";
     }
-    BOOST_LOG_TRIVIAL(warning) << "Colorin LZ diag resolve_begin";
     colorin_resolve_mixed_channels(print_object, segmentation);
-    BOOST_LOG_TRIVIAL(warning) << "Colorin LZ diag resolve_end";
 
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, segmentation.size(), std::max(segmentation.size() / 128, size_t(1))),
