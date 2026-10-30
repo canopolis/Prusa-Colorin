@@ -1510,8 +1510,12 @@ void Print::_make_wipe_tower()
     {
         unsigned int current_extruder_id = m_wipe_tower_data.tool_ordering.all_extruders().back();
         // Prusa Colorin LZ-4c (Orca 0.9.18 Print.cpp 3360-3420): Local-Z toolchanges are planned on the
-        // tower before the nominal ones of each layer. Kept off until the G-code side (LZ-4c2) emits them.
-        constexpr bool colorin_local_z_wipe_tower = false;
+        // tower before the nominal ones of each layer. LZ-4c2b: on when some object has a split Local-Z interval.
+        bool colorin_local_z_wipe_tower = false;
+        for (const PrintObject *object : m_objects)
+            for (const LocalZInterval &interval : object->local_z_intervals())
+                if (interval.has_mixed_paint && interval.sublayer_count > 1)
+                    colorin_local_z_wipe_tower = true;
         std::vector<std::pair<coordf_t, std::vector<GCode::ObjectLayerToPrint>>> colorin_layers_to_print;
         if (colorin_local_z_wipe_tower) {
             for (const PrintObject *object : m_objects)

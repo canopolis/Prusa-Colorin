@@ -1367,6 +1367,7 @@ void GCodeGenerator::_do_export(Print& print, GCodeOutputStream &file, Thumbnail
         // Prusa Multi-Material wipe tower.
         if (has_wipe_tower && ! layers_to_print.empty()) {
             m_wipe_tower = std::make_unique<GCode::WipeTowerIntegration>(print.model().wipe_tower().position.cast<float>(), print.model().wipe_tower().rotation, print.config(), *print.wipe_tower_data().priming.get(), print.wipe_tower_data().tool_changes, *print.wipe_tower_data().final_purge.get());
+            m_wipe_tower->set_local_z_tool_changes(&print.wipe_tower_data().local_z_tool_changes); // Prusa Colorin LZ-4c2b
 
             // Set position for wipe tower generation.
             Vec3d new_position = this->writer().get_position();
@@ -2636,7 +2637,7 @@ LayerResult GCodeGenerator::process_layer(
     bool colorin_lz_active = false;
     {
         bool colorin_lz_requested = false;
-        const bool colorin_lz_wipe_tower = layer_tools.has_wipe_tower && m_wipe_tower;
+        const bool colorin_lz_wipe_tower = false; // Prusa Colorin LZ-4c2b: Local-Z works with the wipe tower
         for (size_t idx = 0; idx < layers.size(); ++idx) {
             const ObjectLayerToPrint &ltp = layers[idx];
             if (ltp.object_layer == nullptr || ltp.object_layer->object() == nullptr)
@@ -2905,7 +2906,13 @@ LayerResult GCodeGenerator::process_layer(
     // Prusa Colorin LZ-3c (Orca 0.9.18 GCode.cpp 5626-6030): Local-Z sub-passes, each at its own Z.
     for (const ColorinLzPass &pass : colorin_lz_passes) {
         const double pass_z = pass.plan->print_z + m_config.z_offset.value;
-        gcode += this->set_extruder(pass.extruder_id, pass_z);
+        if (layer_tools.has_wipe_tower && m_wipe_tower) {
+            // Prusa Colorin LZ-4c2b: toolchange on the wipe tower at the nominal layer Z, then down to the pass Z.
+            gcode += m_wipe_tower->local_z_tool_change(*this, int(pass.extruder_id), print_z);
+            if (this->last_position)
+                gcode += m_writer.travel_to_z(pass_z, "local-z pass");
+        } else
+            gcode += this->set_extruder(pass.extruder_id, pass_z);
         gcode += "; local-z pass z=" + float_to_string_decimal_point(pass_z) + " h=" + float_to_string_decimal_point(pass.plan->flow_height) + "\n";
         const float saved_layer_z = m_last_layer_z;
         m_last_layer_z = static_cast<float>(pass_z);
@@ -2927,6 +2934,9 @@ LayerResult GCodeGenerator::process_layer(
             gcode += m_writer.travel_to_z(m_last_layer_z, "local-z pass done");
     }
 
+    if (!colorin_lz_passes.empty() && layer_tools.has_wipe_tower && m_wipe_tower)
+        gcode += m_wipe_tower->finish_local_z_toolchanges(*this, print_z); // Prusa Colorin LZ-4c2b
+
     // Prusa Colorin LZ-4c2a: base extruders start with the one left active by the Local-Z passes
     // (Orca 0.9.18 rotate_extruders_to_start_with).
     std::vector<size_t> colorin_base_order;
@@ -2945,7 +2955,7 @@ LayerResult GCodeGenerator::process_layer(
     {
         const ExtruderExtrusions &extruder_extrusions = extrusions[colorin_base_idx];
         gcode += (layer_tools.has_wipe_tower && m_wipe_tower) ?
-            m_wipe_tower->tool_change(*this, extruder_extrusions.extruder_id, extruder_extrusions.extruder_id == layer_tools.extruders.back()) :
+            m_wipe_tower->tool_change(*this, extruder_extrusions.extruder_id, colorin_base_idx == colorin_base_order.back()) :
             this->set_extruder(extruder_extrusions.extruder_id, print_z);
 
         // let analyzer tag generator aware of a role type change
