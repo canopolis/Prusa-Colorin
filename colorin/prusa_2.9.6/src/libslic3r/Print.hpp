@@ -552,6 +552,9 @@ struct WipeTowerData
     // Cache of tool changes per print layer.
     std::unique_ptr<std::vector<WipeTower::ToolChangeResult>> priming;
     std::vector<std::vector<WipeTower::ToolChangeResult>> tool_changes;
+    // Prusa Colorin LZ-4c: Local-Z toolchanges per tower layer + reserve slots (Orca 0.9.18)
+    std::vector<std::vector<WipeTower::ToolChangeResult>> local_z_tool_changes;
+    std::vector<std::vector<WipeTower::box_coordinates>>  local_z_reserve_boxes;
     std::unique_ptr<WipeTower::ToolChangeResult>          final_purge;
     std::vector<std::pair<float, std::vector<float>>>     used_filament_until_layer;
     int                                                   number_of_toolchanges;
@@ -572,6 +575,8 @@ struct WipeTowerData
     void clear() {
         priming.reset(nullptr);
         tool_changes.clear();
+        local_z_tool_changes.clear();
+        local_z_reserve_boxes.clear();
         final_purge.reset(nullptr);
         used_filament_until_layer.clear();
         number_of_toolchanges = -1;
