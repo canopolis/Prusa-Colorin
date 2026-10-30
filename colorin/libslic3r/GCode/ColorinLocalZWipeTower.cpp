@@ -135,8 +135,11 @@ static std::vector<unsigned int> rotate_extruders_to_start_with(const std::vecto
 std::vector<LocalZWipeTowerToolchange> collect_local_z_wipe_tower_toolchanges(
     const Print                              &print,
     const std::vector<GCode::ObjectLayerToPrint> &layers,
-    int                                       start_extruder)
+    int                                       start_extruder,
+    std::vector<LocalZPassStep>              *steps_out)
 {
+    if (steps_out != nullptr)
+        steps_out->clear();
     std::vector<LocalZWipeTowerPassRef> pass_refs;
     const float local_z_perimeter_mask_expand = float(scale_(LOCAL_Z_PERIMETER_MASK_EXPAND_MM));
     const bool  lz_infill_enabled = local_z_infill_enabled(print);
@@ -241,6 +244,8 @@ std::vector<LocalZWipeTowerToolchange> collect_local_z_wipe_tower_toolchanges(
 
     auto collect_toolchanges_legacy = [&](int start_tool) {
         std::vector<LocalZWipeTowerToolchange> legacy_toolchanges;
+        if (steps_out != nullptr)
+            steps_out->clear();
         int active_extruder = start_tool;
         size_t pass_ref_idx = 0;
         while (pass_ref_idx < pass_refs.size()) {
@@ -278,6 +283,11 @@ std::vector<LocalZWipeTowerToolchange> collect_local_z_wipe_tower_toolchanges(
                 if (active_extruder >= 0 && active_extruder != int(extruder_id))
                     legacy_toolchanges.push_back(LocalZWipeTowerToolchange{unsigned(active_extruder), extruder_id});
                 active_extruder = int(extruder_id);
+                if (steps_out != nullptr)
+                    for (size_t group_idx = pass_ref_idx; group_idx < pass_group_end; ++group_idx)
+                        if (std::find(pass_refs[group_idx].extruders.begin(), pass_refs[group_idx].extruders.end(), extruder_id) !=
+                            pass_refs[group_idx].extruders.end())
+                            steps_out->push_back(LocalZPassStep{pass_refs[group_idx].layer_to_print_idx, pass_refs[group_idx].plan, extruder_id});
             }
 
             pass_ref_idx = pass_group_end;
@@ -406,6 +416,8 @@ std::vector<LocalZWipeTowerToolchange> collect_local_z_wipe_tower_toolchanges(
     };
 
     std::vector<LocalZWipeTowerToolchange> toolchanges;
+    if (steps_out != nullptr)
+        steps_out->clear();
     int                                    active_extruder = start_extruder;
     size_t                                 completed_passes = 0;
     while (completed_passes < pass_states.size()) {
@@ -437,6 +449,8 @@ std::vector<LocalZWipeTowerToolchange> collect_local_z_wipe_tower_toolchanges(
                 continue;
 
             pass_state.remaining_extruders.erase(it_extruder);
+            if (steps_out != nullptr)
+                steps_out->push_back(LocalZPassStep{pass_state.pass_ref->layer_to_print_idx, pass_state.pass_ref->plan, unsigned(chosen_extruder)});
             completed_any = true;
             if (pass_state.remaining_extruders.empty())
                 newly_completed.push_back(pass_state_idx);
