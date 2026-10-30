@@ -37,6 +37,7 @@
 #include "libslic3r/GCode/Travels.hpp"
 // Prusa Colorin LZ-3c: Local-Z sub-passes (Orca 0.9.18)
 #include "libslic3r/GCode/ColorinLocalZEmit.hpp"
+#include "libslic3r/GCode/ColorinLocalZWipeTower.hpp" // Prusa Colorin LZ-4c2a
 #include "Point.hpp"
 #include "Polygon.hpp"
 #include "PrintConfig.hpp"
@@ -2694,7 +2695,8 @@ LayerResult GCodeGenerator::process_layer(
             return lhs.bucket->plan->pass_index < rhs.bucket->plan->pass_index;
         });
         const SmoothPathGenerator colorin_lz_smooth_path{ m_seam_placer, smooth_path_caches, m_scaled_resolution, m_config, m_enable_loop_clipping };
-        unsigned int colorin_lz_active_extruder = extrusions.empty() ? m_writer.extruder()->id() : extrusions.back().extruder_id;
+        unsigned int colorin_lz_active_extruder = m_writer.extruder() != nullptr ? m_writer.extruder()->id() :
+            (extrusions.empty() ? 0u : extrusions.front().extruder_id); // LZ-4c2a: passes now run before the base
         for (const PassRef &ref : pass_refs) {
             const SubLayerPlan &plan = *ref.bucket->plan;
             // Extruders of this pass, starting with the active one to save a tool change.
@@ -2746,13 +2748,13 @@ LayerResult GCodeGenerator::process_layer(
         return result;
     }
 
-    const auto optional_first_segment{GCode::ExtrusionOrder::get_first_point(extrusions.empty() ? colorin_lz_passes.front().extrusions : extrusions)};
+    const auto optional_first_segment{GCode::ExtrusionOrder::get_first_point(!colorin_lz_passes.empty() ? colorin_lz_passes.front().extrusions : extrusions)};
     if (!optional_first_segment) {
         return result;
     }
     const Geometry::ArcWelder::Segment &first_segment{*optional_first_segment};
     const Vec3crd first_point{to_3d(first_segment.point, scaled(print_z + (first_segment.height_fraction - 1.0) * height))};
-    const PrintInstance* first_instance{extrusions.empty() ?
+    const PrintInstance* first_instance{!colorin_lz_passes.empty() ?
         get_first_instance(colorin_lz_passes.front().extrusions, colorin_lz_passes.front().instances) :
         get_first_instance(extrusions, instances_to_print)};
     m_label_objects.update(first_instance);
@@ -2878,9 +2880,70 @@ LayerResult GCodeGenerator::process_layer(
     this->set_origin({0, 0});
     this->m_moved_to_first_layer_point = false;
 
+    // Prusa Colorin LZ-4c2a: Local-Z sub-passes are printed first and in the Orca 0.9.18 order
+    // (same scheduler as the wipe tower plan), then the base layer.
+    if (colorin_lz_passes.size() > 1) {
+        std::vector<ColorinLocalZ::LocalZPassStep> colorin_lz_steps;
+        ColorinLocalZ::collect_local_z_wipe_tower_toolchanges(
+            print, layers, m_writer.extruder() != nullptr ? int(m_writer.extruder()->id()) : -1, &colorin_lz_steps);
+        std::vector<ColorinLzPass> colorin_lz_ordered;
+        std::vector<bool>          colorin_lz_used(colorin_lz_passes.size(), false);
+        for (const ColorinLocalZ::LocalZPassStep &step : colorin_lz_steps)
+            for (size_t i = 0; i < colorin_lz_passes.size(); ++i)
+                if (!colorin_lz_used[i] && colorin_lz_passes[i].plan == step.plan && colorin_lz_passes[i].extruder_id == step.extruder_id) {
+                    colorin_lz_used[i] = true;
+                    colorin_lz_ordered.emplace_back(std::move(colorin_lz_passes[i]));
+                    break;
+                }
+        for (size_t i = 0; i < colorin_lz_passes.size(); ++i)
+            if (!colorin_lz_used[i])
+                colorin_lz_ordered.emplace_back(std::move(colorin_lz_passes[i]));
+        BOOST_LOG_TRIVIAL(info) << "Local-Z pass order print_z=" << print_z << " passes=" << colorin_lz_ordered.size()
+                                << " scheduled=" << colorin_lz_steps.size();
+        colorin_lz_passes = std::move(colorin_lz_ordered);
+    }
+    // Prusa Colorin LZ-3c (Orca 0.9.18 GCode.cpp 5626-6030): Local-Z sub-passes, each at its own Z.
+    for (const ColorinLzPass &pass : colorin_lz_passes) {
+        const double pass_z = pass.plan->print_z + m_config.z_offset.value;
+        gcode += this->set_extruder(pass.extruder_id, pass_z);
+        gcode += "; local-z pass z=" + float_to_string_decimal_point(pass_z) + " h=" + float_to_string_decimal_point(pass.plan->flow_height) + "\n";
+        const float saved_layer_z = m_last_layer_z;
+        m_last_layer_z = static_cast<float>(pass_z);
+        for (const ExtruderExtrusions &extruder_extrusions : pass.extrusions) {
+            for (std::size_t i{0}; i < pass.instances.size(); ++i) {
+                const InstanceToPrint &instance{pass.instances[i]};
+                using GCode::ExtrusionOrder::SupportPath;
+                const std::vector<SliceExtrusions> &slices_extrusions{extruder_extrusions.normal_extrusions[i].slices_extrusions};
+                if (is_empty(slices_extrusions))
+                    continue;
+                this->initialize_instance(instance, layers[instance.object_layer_to_print_id], i == 0);
+                gcode += this->extrude_slices(instance, layers[instance.object_layer_to_print_id], slices_extrusions);
+            }
+            this->set_origin(0.0, 0.0);
+        }
+        // Back to the nominal layer Z for whatever comes next.
+        m_last_layer_z = saved_layer_z;
+        if (this->last_position)
+            gcode += m_writer.travel_to_z(m_last_layer_z, "local-z pass done");
+    }
+
+    // Prusa Colorin LZ-4c2a: base extruders start with the one left active by the Local-Z passes
+    // (Orca 0.9.18 rotate_extruders_to_start_with).
+    std::vector<size_t> colorin_base_order;
+    for (size_t i = 0; i < extrusions.size(); ++i)
+        colorin_base_order.push_back(i);
+    if (!colorin_lz_passes.empty() && m_writer.extruder() != nullptr) {
+        const unsigned int colorin_active = m_writer.extruder()->id();
+        auto it_active = std::find_if(colorin_base_order.begin(), colorin_base_order.end(),
+                                      [&](size_t i) { return extrusions[i].extruder_id == colorin_active; });
+        if (it_active != colorin_base_order.end())
+            std::rotate(colorin_base_order.begin(), it_active, colorin_base_order.end());
+    }
+
     // Extrude the skirt, brim, support, perimeters, infill ordered by the extruders.
-    for (const ExtruderExtrusions &extruder_extrusions : extrusions)
+    for (size_t colorin_base_idx : colorin_base_order)
     {
+        const ExtruderExtrusions &extruder_extrusions = extrusions[colorin_base_idx];
         gcode += (layer_tools.has_wipe_tower && m_wipe_tower) ?
             m_wipe_tower->tool_change(*this, extruder_extrusions.extruder_id, extruder_extrusions.extruder_id == layer_tools.extruders.back()) :
             this->set_extruder(extruder_extrusions.extruder_id, print_z);
@@ -3005,30 +3068,6 @@ LayerResult GCodeGenerator::process_layer(
         this->set_origin(0.0, 0.0);
     }
 
-    // Prusa Colorin LZ-3c (Orca 0.9.18 GCode.cpp 5626-6030): Local-Z sub-passes, each at its own Z.
-    for (const ColorinLzPass &pass : colorin_lz_passes) {
-        const double pass_z = pass.plan->print_z + m_config.z_offset.value;
-        gcode += this->set_extruder(pass.extruder_id, pass_z);
-        gcode += "; local-z pass z=" + float_to_string_decimal_point(pass_z) + " h=" + float_to_string_decimal_point(pass.plan->flow_height) + "\n";
-        const float saved_layer_z = m_last_layer_z;
-        m_last_layer_z = static_cast<float>(pass_z);
-        for (const ExtruderExtrusions &extruder_extrusions : pass.extrusions) {
-            for (std::size_t i{0}; i < pass.instances.size(); ++i) {
-                const InstanceToPrint &instance{pass.instances[i]};
-                using GCode::ExtrusionOrder::SupportPath;
-                const std::vector<SliceExtrusions> &slices_extrusions{extruder_extrusions.normal_extrusions[i].slices_extrusions};
-                if (is_empty(slices_extrusions))
-                    continue;
-                this->initialize_instance(instance, layers[instance.object_layer_to_print_id], i == 0);
-                gcode += this->extrude_slices(instance, layers[instance.object_layer_to_print_id], slices_extrusions);
-            }
-            this->set_origin(0.0, 0.0);
-        }
-        // Back to the nominal layer Z for whatever comes next.
-        m_last_layer_z = saved_layer_z;
-        if (this->last_position)
-            gcode += m_writer.travel_to_z(m_last_layer_z, "local-z pass done");
-    }
 
     BOOST_LOG_TRIVIAL(trace) << "Exported layer " << layer.id() << " print_z " << print_z <<
     log_memory_info();
