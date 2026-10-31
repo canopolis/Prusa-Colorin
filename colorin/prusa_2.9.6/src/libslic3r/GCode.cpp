@@ -2668,7 +2668,9 @@ LayerResult GCodeGenerator::process_layer(
             for (size_t idx = 0; idx < layers.size(); ++idx)
                 if (colorin_lz_contexts[idx].enabled)
                     ColorinLocalZ::swap_in_base(*colorin_lz_base_swap, *layers[idx].object_layer, colorin_lz_contexts[idx], colorin_lz_infill, print_z);
+try { BOOST_LOG_TRIVIAL(warning) << "Colorin DIAG get_sorted_extrusions_begin print_z=" << print_z;
         extrusions = this->get_sorted_extrusions(print, layers, layer_tools, instances_to_print, smooth_path_caches, first_layer);
+} catch (const std::exception &colorin_e) { BOOST_LOG_TRIVIAL(error) << "Colorin DIAG get_sorted_extrusions exception print_z=" << print_z << " what=" << colorin_e.what(); throw; } catch (...) { BOOST_LOG_TRIVIAL(error) << "Colorin DIAG get_sorted_extrusions unknown exception print_z=" << print_z; throw; }
         colorin_lz_base_swap->restore();
     }
 
@@ -2712,6 +2714,7 @@ LayerResult GCodeGenerator::process_layer(
                                   [colorin_lz_active_extruder](unsigned int e) { return e == colorin_lz_active_extruder; });
             for (unsigned int extruder_id : pass_extruders) {
                 auto swap = std::make_unique<ColorinLocalZ::LocalZLayerSwap>();
+BOOST_LOG_TRIVIAL(warning) << "Colorin DIAG swap_in_pass_begin print_z=" << print_z << " extruder=" << extruder_id;
                 if (!ColorinLocalZ::swap_in_pass(*swap, *layers[ref.layer_idx].object_layer, colorin_lz_contexts[ref.layer_idx], *ref.bucket,
                                                  extruder_id, colorin_lz_infill, print_z))
                     continue;
@@ -2730,10 +2733,13 @@ LayerResult GCodeGenerator::process_layer(
                 lz_tools.has_skirt         = false;
                 const std::optional<Point> lz_previous_position{
                     this->last_position ? std::optional{scaled(this->point_to_gcode(*this->last_position))} : std::nullopt};
+try { BOOST_LOG_TRIVIAL(warning) << "Colorin DIAG get_extrusions_begin print_z=" << print_z << " extruder=" << extruder_id;
                 pass.extrusions = GCode::ExtrusionOrder::get_extrusions(
                     print, nullptr, lz_layers, first_layer, lz_tools, pass.instances, {}, extruder_id,
                     colorin_lz_smooth_path, false, lz_previous_position);
+} catch (const std::exception &colorin_e) { BOOST_LOG_TRIVIAL(error) << "Colorin DIAG get_extrusions exception print_z=" << print_z << " extruder=" << extruder_id << " what=" << colorin_e.what(); throw; } catch (...) { BOOST_LOG_TRIVIAL(error) << "Colorin DIAG get_extrusions unknown exception print_z=" << print_z << " extruder=" << extruder_id; throw; }
                 swap->restore();
+BOOST_LOG_TRIVIAL(warning) << "Colorin DIAG pass_done print_z=" << print_z << " extruder=" << extruder_id;
                 colorin_lz_pass_swaps.emplace_back(std::move(swap));
                 if (pass.extrusions.empty())
                     continue;
