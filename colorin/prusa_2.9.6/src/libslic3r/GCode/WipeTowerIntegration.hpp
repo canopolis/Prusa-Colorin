@@ -65,7 +65,12 @@ public:
             return std::nullopt;
         }
 
-        return m_tool_changes.at(m_layer_idx).at(index);
+        // Prusa Colorin: with Local-Z the base layer may ask for more tool changes than the tower planned
+        // (look-ahead only, used for travel positions); return nothing instead of throwing.
+        const auto &colorin_layer_changes = m_tool_changes.at(m_layer_idx);
+        if (index >= colorin_layer_changes.size())
+            return std::nullopt;
+        return colorin_layer_changes[index];
     }
 
     Vec2f transform_wt_pt(const Vec2f& pt) const {
