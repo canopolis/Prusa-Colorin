@@ -1370,6 +1370,9 @@ static void colorin_import_mixed_filaments_from_3mf(const std::string &filename,
         if (!boost::algorithm::starts_with(key, "mixed_") && !boost::algorithm::starts_with(key, "dithering_") &&
             !boost::algorithm::starts_with(key, "local_z_"))
             continue;
+        // Prusa Colorin: Local-Z on/off lives in the print preset (Tab checkbox), not in the project config.
+        if (key == "dithering_local_z_mode")
+            continue;
         if (const ConfigOption *opt = loaded.option(key)) {
             project.set_key_value(key, opt->clone());
             ++copied;
