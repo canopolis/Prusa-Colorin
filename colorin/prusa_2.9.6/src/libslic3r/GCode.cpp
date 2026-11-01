@@ -1,3 +1,4 @@
+#include <atomic> // Prusa Colorin
 ///|/ Copyright (c) Prusa Research 2016 - 2023 Lukáš Matěna @lukasmatena, Vojtěch Bubník @bubnikv, Enrico Turri @enricoturri1966, Pavel Mikuš @Godrak, Oleksandra Iushchenko @YuSanka, Lukáš Hejl @hejllukas, Filip Sykala @Jony01, David Kocík @kocikdav
 ///|/ Copyright (c) SuperSlicer 2023 Remi Durand @supermerill
 ///|/ Copyright (c) 2021 Justin Schuh @jschuh
@@ -101,6 +102,8 @@ using namespace std::literals::string_view_literals;
 #include <assert.h>
 
 namespace Slic3r {
+// Prusa Colorin: Local-Z tool changes emitted in process_layer (not part of ToolOrdering).
+static std::atomic<int> s_colorin_lz_toolchanges{0};
 
 // Only add a newline in case the current G-code does not end with a newline.
     static inline void check_add_eol(std::string& gcode)
@@ -958,6 +961,7 @@ static inline std::optional<std::string> find_M84(const std::string &gcode) {
 
 void GCodeGenerator::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGeneratorCallback thumbnail_cb)
 {
+    s_colorin_lz_toolchanges = 0; // Prusa Colorin
     const bool export_to_binary_gcode = print.full_print_config().option<ConfigOptionBool>("binary_gcode")->value;
 
     std::string prepared_by_info;
@@ -1477,7 +1481,7 @@ void GCodeGenerator::_do_export(Print& print, GCodeOutputStream &file, Thumbnail
         this->config(),
         m_writer.extruders(),
         initial_extruder_id,
-        tool_ordering.toolchanges_count(),
+        tool_ordering.toolchanges_count() + s_colorin_lz_toolchanges.load(), // Prusa Colorin: + Local-Z changes
         // Modifies
         print.m_print_statistics,
         export_to_binary_gcode,
@@ -2906,6 +2910,9 @@ LayerResult GCodeGenerator::process_layer(
     // Prusa Colorin LZ-3c (Orca 0.9.18 GCode.cpp 5626-6030): Local-Z sub-passes, each at its own Z.
     for (const ColorinLzPass &pass : colorin_lz_passes) {
         const double pass_z = pass.plan->print_z + m_config.z_offset.value;
+        // Prusa Colorin: count Local-Z tool changes for Sliced Info "Number of tool changes"
+        if (m_writer.extruder() == nullptr || m_writer.extruder()->id() != pass.extruder_id)
+            ++s_colorin_lz_toolchanges;
         if (layer_tools.has_wipe_tower && m_wipe_tower) {
             // Prusa Colorin LZ-4c2b: toolchange on the wipe tower at the nominal layer Z, then down to the pass Z.
             gcode += m_wipe_tower->local_z_tool_change(*this, int(pass.extruder_id), print_z);
