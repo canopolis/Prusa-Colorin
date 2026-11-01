@@ -57,7 +57,7 @@ static std::vector<std::string> s_project_options {
     "mixed_color_layer_height_a",
     "mixed_color_layer_height_b",
     "dithering_z_step_size",
-    "dithering_local_z_mode",
+    // "dithering_local_z_mode", // Prusa Colorin: lives in the print preset (Tab checkbox)
     "dithering_local_z_whole_objects",
     "dithering_local_z_preserve_first_layer",
     "dithering_local_z_infill",
