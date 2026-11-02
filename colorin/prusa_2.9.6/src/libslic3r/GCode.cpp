@@ -38,6 +38,7 @@
 #include "libslic3r/GCode/Travels.hpp"
 // Prusa Colorin LZ-3c: Local-Z sub-passes (Orca 0.9.18)
 #include "libslic3r/GCode/ColorinLocalZEmit.hpp"
+#include "libslic3r/ImageMap/AdaptiveLocalZRenderer.hpp" // Prusa Colorin LZ-5b
 #include "libslic3r/GCode/ColorinLocalZWipeTower.hpp" // Prusa Colorin LZ-4c2a
 #include "Point.hpp"
 #include "Polygon.hpp"
@@ -2682,6 +2683,10 @@ LayerResult GCodeGenerator::process_layer(
         unsigned int                     extruder_id { 0 };
         std::vector<InstanceToPrint>     instances;
         std::vector<ExtruderExtrusions>  extrusions;
+        // Prusa Colorin LZ-5b: external perimeters printed with the adaptive Local-Z renderer.
+        std::vector<ExtrusionPath> adaptive_paths;
+        const PrintObject *object { nullptr };
+        const Layer *layer { nullptr };
     };
     std::vector<ColorinLzPass> colorin_lz_passes;
     if (colorin_lz_active) {
@@ -2724,6 +2729,11 @@ LayerResult GCodeGenerator::process_layer(
                 ColorinLzPass pass;
                 pass.plan        = &plan;
                 pass.extruder_id = extruder_id;
+                if (plan.adaptive_nonplanar) { // Prusa Colorin LZ-5b
+                    pass.adaptive_paths = ColorinLocalZ::take_external_perimeter_paths(*swap, *layers[ref.layer_idx].object_layer);
+                    pass.object = layers[ref.layer_idx].object_layer->object();
+                    pass.layer = layers[ref.layer_idx].object_layer;
+                }
                 for (const InstanceToPrint &instance : instances_to_print)
                     if (instance.object_layer_to_print_id == ref.layer_idx)
                         pass.instances.push_back(instance);
@@ -2739,7 +2749,7 @@ LayerResult GCodeGenerator::process_layer(
                     colorin_lz_smooth_path, false, lz_previous_position);
                 swap->restore();
                 colorin_lz_pass_swaps.emplace_back(std::move(swap));
-                if (pass.extrusions.empty())
+                if (pass.extrusions.empty() && pass.adaptive_paths.empty())
                     continue;
                 colorin_lz_active_extruder = extruder_id;
                 colorin_lz_passes.emplace_back(std::move(pass));
@@ -2908,6 +2918,7 @@ LayerResult GCodeGenerator::process_layer(
         colorin_lz_passes = std::move(colorin_lz_ordered);
     }
     // Prusa Colorin LZ-3c (Orca 0.9.18 GCode.cpp 5626-6030): Local-Z sub-passes, each at its own Z.
+    std::map<const PrintObject*, std::unique_ptr<ImageMap::AdaptiveLocalZRenderer>> colorin_adaptive_renderers; // Prusa Colorin LZ-5b
     for (const ColorinLzPass &pass : colorin_lz_passes) {
         const double pass_z = pass.plan->print_z + m_config.z_offset.value;
         // Prusa Colorin: count Local-Z tool changes for Sliced Info "Number of tool changes"
@@ -2932,6 +2943,71 @@ LayerResult GCodeGenerator::process_layer(
                     continue;
                 this->initialize_instance(instance, layers[instance.object_layer_to_print_id], i == 0);
                 gcode += this->extrude_slices(instance, layers[instance.object_layer_to_print_id], slices_extrusions);
+            }
+            this->set_origin(0.0, 0.0);
+        }
+        // Prusa Colorin LZ-5b (Orca 0.9.18 GCode.cpp 5717-5733 and _extrude 7206-7226): adaptive Local-Z external perimeters,
+        // printed as sloped segments whose Z follows the renderer profile.
+        if (!pass.adaptive_paths.empty() && pass.object != nullptr && pass.layer != nullptr && m_writer.extruder() != nullptr) {
+            std::unique_ptr<ImageMap::AdaptiveLocalZRenderer> &colorin_renderer = colorin_adaptive_renderers[pass.object];
+            if (!colorin_renderer)
+                colorin_renderer = ImageMap::AdaptiveLocalZRenderer::create(*pass.object);
+            const SubLayerPlan &aplan = *pass.plan;
+            const ConfigOption *colorin_lb_opt = print.full_print_config().option("mixed_filament_height_lower_bound");
+            const double colorin_lower_bound = colorin_lb_opt != nullptr ? colorin_lb_opt->getFloat() : 0.;
+            const bool colorin_cycle = aplan.adaptive_cycle_z_hi > aplan.adaptive_cycle_z_lo + EPSILON;
+            const double colorin_z_lo = (colorin_cycle ? aplan.adaptive_cycle_z_lo : aplan.z_lo) + m_config.z_offset.value;
+            const double colorin_z_hi = (colorin_cycle ? aplan.adaptive_cycle_z_hi : aplan.z_hi) + m_config.z_offset.value;
+            double colorin_speed = 0.;
+            if (!pass.layer->regions().empty())
+                colorin_speed = pass.layer->regions().front()->region().config().get_abs_value("external_perimeter_speed");
+            if (colorin_speed <= 0.)
+                colorin_speed = 25.;
+            const double colorin_e_per_mm3 = m_writer.extruder()->e_per_mm3();
+            for (const InstanceToPrint &instance : pass.instances) {
+                this->set_origin(unscale(instance.print_object.instances()[instance.instance_id].shift));
+                std::optional<Point> colorin_last;
+                auto colorin_emit = [&](const Points &pts, double mm3_per_mm, double z_begin, double z_end) {
+                    if (pts.size() < 2)
+                        return;
+                    double total = 0.;
+                    for (size_t k = 1; k < pts.size(); ++k)
+                        total += (pts[k] - pts[k - 1]).cast<double>().norm();
+                    if (total <= 0.)
+                        return;
+                    if (!colorin_last || (*colorin_last - pts.front()).cast<double>().norm() > scaled<double>(0.001)) {
+                        gcode += this->retract_and_wipe();
+                        const Vec2d p0 = this->point_to_gcode(pts.front());
+                        gcode += m_writer.travel_to_xyz(Vec3d(p0.x(), p0.y(), z_begin), "local-z adaptive");
+                        gcode += this->unretract();
+                    }
+                    gcode += m_writer.set_speed(60. * colorin_speed);
+                    double done = 0.;
+                    for (size_t k = 1; k < pts.size(); ++k) {
+                        const double len = (pts[k] - pts[k - 1]).cast<double>().norm();
+                        done += len;
+                        const Vec2d p = this->point_to_gcode(pts[k]);
+                        const double z = z_begin + (z_end - z_begin) * (done / total);
+                        gcode += m_writer.extrude_to_xyz(Vec3d(p.x(), p.y(), z), unscaled(len) * mm3_per_mm * colorin_e_per_mm3);
+                    }
+                    colorin_last = pts.back();
+                    this->last_position = pts.back();
+                };
+                for (const ExtrusionPath &apath : pass.adaptive_paths) {
+                    std::vector<ExtrusionPathSloped> segments;
+                    if (colorin_renderer)
+                        segments = colorin_renderer->modulate_path(apath, *pass.layer, pass.layer->lslices,
+                            aplan.adaptive_component_ids, aplan.adaptive_component_weights, aplan.adaptive_component_index,
+                            colorin_z_lo, colorin_z_hi, aplan.adaptive_sample_z, colorin_lower_bound);
+                    if (segments.empty()) {
+                        colorin_emit(apath.polyline.points, apath.mm3_per_mm(), pass_z, pass_z);
+                        continue;
+                    }
+                    for (const ExtrusionPathSloped &seg : segments)
+                        colorin_emit(seg.polyline.points, seg.mm3_per_mm(), seg.absolute_z_begin, seg.absolute_z_end);
+                }
+                if (this->last_position)
+                    gcode += m_writer.travel_to_z(pass_z, "local-z adaptive done");
             }
             this->set_origin(0.0, 0.0);
         }
