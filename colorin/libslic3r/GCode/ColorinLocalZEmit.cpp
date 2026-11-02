@@ -150,5 +150,44 @@ bool swap_in_pass(LocalZLayerSwap &swap, const Layer &layer, LocalZLayerContext 
     return any;
 }
 
+static void colorin_take_external_paths(ExtrusionEntityCollection &coll, std::vector<ExtrusionPath> &out)
+{
+    for (size_t i = 0; i < coll.entities.size();) {
+        ExtrusionEntity *e = coll.entities[i];
+        if (auto *sub = dynamic_cast<ExtrusionEntityCollection*>(e)) {
+            colorin_take_external_paths(*sub, out);
+            ++i;
+            continue;
+        }
+        bool take = false;
+        if (auto *loop = dynamic_cast<ExtrusionLoop*>(e)) {
+            if (loop->role().is_external_perimeter()) { for (const ExtrusionPath &p : loop->paths) out.push_back(p); take = true; }
+        } else if (auto *multi = dynamic_cast<ExtrusionMultiPath*>(e)) {
+            if (multi->role().is_external_perimeter()) { for (const ExtrusionPath &p : multi->paths) out.push_back(p); take = true; }
+        } else if (auto *path = dynamic_cast<ExtrusionPath*>(e)) {
+            if (path->role().is_external_perimeter()) { out.push_back(*path); take = true; }
+        }
+        if (take) {
+            delete e;
+            coll.entities.erase(coll.entities.begin() + i);
+        } else
+            ++i;
+    }
+}
+
+std::vector<ExtrusionPath> take_external_perimeter_paths(LocalZLayerSwap &swap, const Layer &layer)
+{
+    std::vector<ExtrusionPath> out;
+    for (const LayerRegion *layerm : layer.regions()) {
+        if (layerm == nullptr)
+            continue;
+        for (ExtrusionEntity *e : layerm->perimeters().entities)
+            if (swap.owns(e))
+                if (auto *coll = dynamic_cast<ExtrusionEntityCollection*>(e))
+                    colorin_take_external_paths(*coll, out);
+    }
+    return out;
+}
+
 } // namespace ColorinLocalZ
 } // namespace Slic3r

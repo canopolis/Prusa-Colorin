@@ -8,6 +8,7 @@
 // layer G-code is finished, because the sorted extrusions keep pointers to them.
 #pragma once
 
+#include "libslic3r/ExtrusionEntity.hpp" // Prusa Colorin LZ-5b
 #include <memory>
 #include <vector>
 #include "ColorinLocalZContext.hpp"
@@ -31,6 +32,8 @@ public:
 
     // Puts back the original extrusion pointers. The clipped collections are kept alive.
     void restore();
+    // Prusa Colorin LZ-5b: true when the entity is one of the clipped copies owned by this swap.
+    bool owns(const ExtrusionEntity *entity) const { for (const auto &p : m_owned) if (p.get() == entity) return true; return false; }
     // Replaces slot idx of parent with replacement (owned by this object). nullptr -> empty collection.
     void replace(ExtrusionEntityCollection &parent, size_t idx, std::unique_ptr<ExtrusionEntityCollection> replacement);
 
@@ -50,6 +53,10 @@ void swap_in_base(LocalZLayerSwap &swap, const Layer &layer, LocalZLayerContext 
 // with the pass flow height. Returns false when nothing of this layer falls inside the masks.
 bool swap_in_pass(LocalZLayerSwap &swap, const Layer &layer, LocalZLayerContext &ctx, const LocalZPassBucket &bucket,
                   size_t extruder_id, bool infill_enabled, double print_z);
+
+// Prusa Colorin LZ-5b: moves the external-perimeter paths out of the clipped (owned) perimeter copies of a pass,
+// so they can be printed with the adaptive Local-Z renderer (Orca 0.9.18 _extrude adaptive branch).
+std::vector<ExtrusionPath> take_external_perimeter_paths(LocalZLayerSwap &swap, const Layer &layer);
 
 } // namespace ColorinLocalZ
 } // namespace Slic3r
