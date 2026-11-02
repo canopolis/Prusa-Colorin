@@ -449,6 +449,8 @@ std::vector<OverridenExtrusions> get_overriden_extrusions(
         if (const Layer *layer = layers[instance.object_layer_to_print_id].object_layer; layer) {
             const auto should_pick_extrusion = [&layer_tools, &instance, &extruder_id](const ExtrusionEntityCollection &entity_collection,
                                        const PrintRegion &region) {
+                if (layer_tools.colorin_cadence_extruder(&instance.print_object) >= 0)
+                    return false;
                 if (!is_overriden(entity_collection, layer_tools, instance.instance_id)) {
                     return false;
                 }
@@ -505,6 +507,9 @@ std::vector<NormalExtrusions> get_normal_extrusions(
 
         if (const Layer *layer = layers[instance.object_layer_to_print_id].object_layer; layer) {
             const auto should_pick_extrusion{[&layer_tools, &instance, &extruder_id](const ExtrusionEntityCollection &entity_collection, const PrintRegion &region){
+                // Prusa Colorin: whole-object cadence (Simple Perimeter Modulation) owns every extrusion.
+                if (const int colorin_cadence = layer_tools.colorin_cadence_extruder(&instance.print_object); colorin_cadence >= 0)
+                    return colorin_cadence == static_cast<int>(extruder_id);
                 if (is_overriden(entity_collection, layer_tools, instance.instance_id)) {
                     return false;
                 }

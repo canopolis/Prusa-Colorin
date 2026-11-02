@@ -113,6 +113,13 @@ public:
     float                       colorin_mixed_layer_height_a    = 0.f;
     float                       colorin_mixed_layer_height_b    = 0.f;
     float                       colorin_mixed_base_layer_height = 0.2f;
+    // Prusa Colorin (Orca 0.9.18 ToolOrdering): Simple Perimeter Modulation with whole-object cadence.
+    // Zero-based physical extruder that prints every extrusion of that object on this layer.
+    std::map<const PrintObject*, int> colorin_object_cadence;
+    int colorin_cadence_extruder(const PrintObject *object) const {
+        auto it = colorin_object_cadence.find(object);
+        return it == colorin_object_cadence.end() ? -1 : it->second;
+    }
 
     coordf_t 					print_z	= 0.;
     bool 						has_object = false;

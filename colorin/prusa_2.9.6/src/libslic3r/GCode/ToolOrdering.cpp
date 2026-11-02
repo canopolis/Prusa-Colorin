@@ -12,6 +12,7 @@
 #include "libslic3r/ExtrusionRole.hpp"
 #include "libslic3r/LayerRegion.hpp"
 #include "libslic3r/Model.hpp"
+#include "ImageMap/PerimeterEnvelopeRenderer.hpp"
 #include "tcbspan/span.hpp"
 
 // #define SLIC3R_DEBUG
@@ -393,6 +394,28 @@ void ToolOrdering::collect_extruders(
                 assert(layer_tools.extruder_needed_for_color_changer == 0); // Just on color change per layer is allowed.
                 layer_tools.extruder_needed_for_color_changer = it_per_layer_color_changes->second;
                 layer_tools.extruders.emplace_back(it_per_layer_color_changes->second);
+            }
+        }
+
+        // Prusa Colorin (Orca 0.9.18 ToolOrdering 728-830): Simple Perimeter Modulation with whole-object
+        // cadence prints every object extrusion of this layer with the physical filament picked by the cadence.
+        if (layer_tools.colorin_mixed_mgr != nullptr && layer_tools.colorin_num_physical > 0 && object.model_object() != nullptr) {
+            const std::optional<unsigned int> colorin_cadence = ImageMap::model_whole_object_cadence_filament(
+                *object.model_object(), *layer_tools.colorin_mixed_mgr, layer_tools.colorin_num_physical,
+                int(layer->id()), float(layer->print_z), float(layer->height));
+            if (colorin_cadence && *colorin_cadence >= 1) {
+                bool colorin_has_extrusions = false;
+                for (const LayerRegion *colorin_layerm : layer->regions())
+                    if (! colorin_layerm->perimeters().empty() || ! colorin_layerm->fills().empty()) {
+                        colorin_has_extrusions = true;
+                        break;
+                    }
+                if (colorin_has_extrusions) {
+                    layer_tools.extruders.emplace_back(*colorin_cadence);
+                    layer_tools.has_object = true;
+                    layer_tools.colorin_object_cadence[&object] = int(*colorin_cadence) - 1;
+                }
+                continue;
             }
         }
 
