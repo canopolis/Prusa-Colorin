@@ -976,8 +976,11 @@ static void set_color_match_config_bool(PresetBundle& preset_bundle, const std::
 {
     // Prusa Colorin: skip Orca-only keys PrusaSlicer does not define (e.g. fs_surface_paint_only),
     // otherwise set_key_value throws UnknownOptionException when an image-map mode is chosen.
-    if (print_config_def.get(key) == nullptr)
+    if (print_config_def.get(key) == nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << "Colorin DIAG color-match key missing in PrusaSlicer config: " << key;
         return;
+    }
+    BOOST_LOG_TRIVIAL(warning) << "Colorin DIAG color-match set " << key << "=" << value;
     DynamicPrintConfig &print_config = preset_bundle.prints.get_edited_preset().config;
     if (ConfigOptionBool *option = print_config.option<ConfigOptionBool>(key))
         option->value = value;
