@@ -9,6 +9,7 @@
 #pragma once
 
 #include "libslic3r/ExtrusionEntity.hpp" // Prusa Colorin LZ-5b
+#include "libslic3r/ExtrusionEntityCollection.hpp" // Prusa Colorin LZ-5b
 #include <memory>
 #include <vector>
 #include "ColorinLocalZContext.hpp"
@@ -33,7 +34,7 @@ public:
     // Puts back the original extrusion pointers. The clipped collections are kept alive.
     void restore();
     // Prusa Colorin LZ-5b: true when the entity is one of the clipped copies owned by this swap.
-    bool owns(const ExtrusionEntity *entity) const { for (const auto &p : m_owned) if (p.get() == entity) return true; return false; }
+    bool owns(const ExtrusionEntity *entity) const { for (const auto &p : m_owned) if (static_cast<const ExtrusionEntity*>(p.get()) == entity) return true; return false; }
     // Replaces slot idx of parent with replacement (owned by this object). nullptr -> empty collection.
     void replace(ExtrusionEntityCollection &parent, size_t idx, std::unique_ptr<ExtrusionEntityCollection> replacement);
 
