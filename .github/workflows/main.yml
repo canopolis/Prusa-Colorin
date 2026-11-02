@@ -248,10 +248,10 @@ jobs:
           # Prusa Colorin: lanzador con log dentro del portable.
           Copy-Item -Force "$env:GITHUB_WORKSPACE\colorin\iniciar_con_log.bat" "$pkg\iniciar_con_log.bat"
           Write-Host "Archivos en el portable: $((Get-ChildItem $pkg -Recurse -File).Count)"
-          Compress-Archive -Path "$pkg\*" -DestinationPath "PrusaColorin-portable.zip"
+          Compress-Archive -Path "$pkg\*" -DestinationPath "PrusaColorin-portable-${{ github.run_number }}.zip"
 
       - name: Subir resultado
         uses: actions/upload-artifact@v4
         with:
-          name: PrusaColorin-portable
-          path: PrusaColorin-portable.zip
+          name: PrusaColorin-portable-${{ github.run_number }}
+          path: PrusaColorin-portable-${{ github.run_number }}.zip
