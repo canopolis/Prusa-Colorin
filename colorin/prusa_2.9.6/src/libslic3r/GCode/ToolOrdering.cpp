@@ -12,7 +12,7 @@
 #include "libslic3r/ExtrusionRole.hpp"
 #include "libslic3r/LayerRegion.hpp"
 #include "libslic3r/Model.hpp"
-#include "ImageMap/PerimeterEnvelopeRenderer.hpp"
+#include "libslic3r/ImageMap/PerimeterEnvelopeRenderer.hpp"
 #include "tcbspan/span.hpp"
 
 // #define SLIC3R_DEBUG
