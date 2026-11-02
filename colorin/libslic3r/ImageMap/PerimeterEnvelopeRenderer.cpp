@@ -1992,7 +1992,7 @@ std::optional<unsigned int> model_whole_object_cadence_filament(const ModelObjec
                     for (const auto colorin_id : definition->recipe.blend.component_ids(num_physical))
                         colorin_ids_s += std::to_string(colorin_id) + " ";
                 BOOST_LOG_TRIVIAL(warning) << "Colorin DIAG CAD layer=" << layer_index << " z=" << layer_print_z << " h=" << layer_height
-                                           << " palette_front=" << zone.palette.front() << " filament_id=" << filament_id
+                                           << " filament_id=" << filament_id
                                            << " num_physical=" << num_physical << " num_total=" << num_total
                                            << " has_def=" << bool(definition)
                                            << " pm=" << (definition ? int(definition->behavior.surface_bias.perimeter_modulation) : -1)
