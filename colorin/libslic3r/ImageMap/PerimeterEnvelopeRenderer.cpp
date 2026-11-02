@@ -1,4 +1,5 @@
 #include "PerimeterEnvelopeRenderer.hpp"
+#include <boost/log/trivial.hpp> // Prusa Colorin DIAG
 
 #include "BoundaryModulation.hpp"
 #include "ContinuousColorSolver.hpp"
@@ -2002,6 +2003,26 @@ std::unique_ptr<PerimeterEnvelopeRenderer> PerimeterEnvelopeRenderer::create(con
 {
     const Print*       print        = print_object.print();
     const ModelObject* model_object = print_object.model_object();
+    // Prusa Colorin DIAG (Adaptive Modulation): why the perimeter renderer is or is not created.
+    if (print != nullptr && model_object != nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << "Colorin DIAG PER create object=" << model_object->name
+            << " bias_enabled=" << print->config().mixed_filament_component_bias_enabled.value
+            << " gradient_strength=" << print->config().texture_mapping_outer_wall_gradient_global_strength.value
+            << " model_has_perimeter_modulation=" << model_has_perimeter_modulation(*model_object);
+        for (const ModelVolume *v : model_object->volumes) {
+            if (v == nullptr)
+                continue;
+            const std::shared_ptr<const VolumeData> d = v->image_map_data();
+            BOOST_LOG_TRIVIAL(warning) << "Colorin DIAG PER volume=" << v->name << " model_part=" << v->is_model_part()
+                << " extruder=" << v->extruder_id() << " image_map=" << (d ? 1 : 0)
+                << " zones=" << (d ? d->zones.size() : size_t(0)) << " bindings=" << (d ? d->triangle_bindings.size() : size_t(0));
+            if (d)
+                for (size_t z = 0; z < d->zones.size(); ++z)
+                    BOOST_LOG_TRIVIAL(warning) << "Colorin DIAG PER zone=" << z << " enabled=" << d->zones[z].enabled
+                        << " render_mode=" << int(d->zones[z].render_mode) << " adaptive_mode=" << int(d->zones[z].adaptive_modulation_mode)
+                        << " palette=" << d->zones[z].palette.size();
+        }
+    }
     if (print == nullptr || model_object == nullptr || !print->config().mixed_filament_component_bias_enabled.value ||
         print->config().texture_mapping_outer_wall_gradient_global_strength.value <= EPSILON ||
         !model_has_perimeter_modulation(*model_object))
