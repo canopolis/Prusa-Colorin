@@ -397,21 +397,6 @@ void ToolOrdering::collect_extruders(
             }
         }
 
-        // Prusa Colorin DIAG (temporary): which tool each region resolves to on this layer.
-        if (layer->id() < 6 || layer->id() % 50 == 0) {
-            std::string colorin_diag;
-            for (const LayerRegion *colorin_rm : layer->regions()) {
-                const unsigned int colorin_pe = colorin_rm->region().config().perimeter_extruder.value;
-                const unsigned int colorin_ie = colorin_rm->region().config().infill_extruder.value;
-                colorin_diag += " [pe=" + std::to_string(colorin_pe) + "->" + std::to_string(layer_tools.colorin_resolve_mixed_1based(colorin_pe)) +
-                                " ie=" + std::to_string(colorin_ie) + "->" + std::to_string(layer_tools.colorin_resolve_mixed_1based(colorin_ie)) +
-                                " perims=" + std::to_string(colorin_rm->perimeters().size()) + " fills=" + std::to_string(colorin_rm->fills().size()) + "]";
-            }
-            BOOST_LOG_TRIVIAL(warning) << "Colorin DIAG TO layer=" << layer->id() << " z=" << layer->print_z << " h=" << layer->height
-                                       << " mgr=" << (layer_tools.colorin_mixed_mgr != nullptr) << " phys=" << layer_tools.colorin_num_physical
-                                       << " lidx=" << layer_tools.colorin_layer_index << colorin_diag;
-        }
-
         // Prusa Colorin (Orca 0.9.18 ToolOrdering 728-830): Simple Perimeter Modulation with whole-object
         // cadence prints every object extrusion of this layer with the physical filament picked by the cadence.
         if (layer_tools.colorin_mixed_mgr != nullptr && layer_tools.colorin_num_physical > 0 && object.model_object() != nullptr) {
