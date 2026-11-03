@@ -1986,19 +1986,6 @@ std::optional<unsigned int> model_whole_object_cadence_filament(const ModelObjec
             const unsigned int filament_id = resolve_palette_filament(zone.palette.front(), manager, num_physical, num_total);
             const std::optional<MixedFilamentDefinition> definition =
                 manager.mixed_filament_definition_from_id(filament_id, num_physical);
-            if (layer_index < 6 || layer_index % 50 == 0) {
-                std::string colorin_ids_s;
-                if (definition)
-                    for (const auto colorin_id : definition->recipe.blend.component_ids(num_physical))
-                        colorin_ids_s += std::to_string(colorin_id) + " ";
-                BOOST_LOG_TRIVIAL(warning) << "Colorin DIAG CAD layer=" << layer_index << " z=" << layer_print_z << " h=" << layer_height
-                                           << " filament_id=" << filament_id
-                                           << " num_physical=" << num_physical << " num_total=" << num_total
-                                           << " has_def=" << bool(definition)
-                                           << " pm=" << (definition ? int(definition->behavior.surface_bias.perimeter_modulation) : -1)
-                                           << " components=" << colorin_ids_s
-                                           << " resolved=" << manager.resolve(filament_id, num_physical, layer_index, layer_print_z, layer_height);
-            }
             if (!definition || !definition->behavior.surface_bias.perimeter_modulation ||
                 definition->recipe.blend.component_ids(num_physical).size() < 2)
                 continue;
