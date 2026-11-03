@@ -1245,6 +1245,15 @@ void ObjColorPanel::build_method_section(wxWindow* parent, wxBoxSizer* parent_si
            "controlled in the XY perimeter or by varying the nozzle Z along the perimeter."),
         2);
 
+    // Prusa Colorin: Adaptive Modulation is hidden (decision 2026-11). The code stays, but the option can't be chosen.
+    if (m_method_adaptive_radio->GetValue()) {
+        m_method_adaptive_radio->SetValue(false);
+        m_method_standard_radio->SetValue(true);
+    }
+    if (wxSizer *colorin_adaptive_row = m_method_adaptive_radio->GetContainingSizer())
+        colorin_adaptive_row->ShowItems(false);
+    m_method_adaptive_radio->Hide();
+
     auto* color_model_row   = new wxBoxSizer(wxHORIZONTAL);
     auto* color_model_label = new wxStaticText(parent, wxID_ANY, _L("Color model:"));
     color_model_label->SetFont(Label::Body_14);
