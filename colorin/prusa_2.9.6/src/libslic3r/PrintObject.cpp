@@ -2795,10 +2795,26 @@ PrintRegionConfig region_config_from_model_volume(const PrintRegionConfig       
         *out_source_virtual_extruder_id = source_virtual;
     }
 
+    // Prusa Colorin (Orca 0.9.18): a model part carrying an image map may be assigned to a mixed filament
+    // (id above the physical count) by the OBJ colour dialog, e.g. Simple Perimeter Modulation. Orca keeps
+    // that mixed id on the base region and resolves it per layer; Prusa would clamp it to extruder 1.
+    const bool colorin_keep_mixed = volume.is_model_part() && volume.has_image_map_data();
+    const int  colorin_raw_infill = config.infill_extruder.value;
+    const int  colorin_raw_perim  = config.perimeter_extruder.value;
+    const int  colorin_raw_solid  = config.solid_infill_extruder.value;
     // Clamp invalid extruders to the default extruder (with index 1).
     clamp_exturder_to_default(config.infill_extruder,       num_physical_extruders, virtual_extruders);
     clamp_exturder_to_default(config.perimeter_extruder,    num_physical_extruders, virtual_extruders);
     clamp_exturder_to_default(config.solid_infill_extruder, num_physical_extruders, virtual_extruders);
+    if (colorin_keep_mixed) {
+        auto colorin_restore = [num_physical_extruders](ConfigOptionInt &opt, int raw) {
+            if (raw > int(num_physical_extruders) && raw <= int(num_physical_extruders) + 255)
+                opt.value = raw;
+        };
+        colorin_restore(config.infill_extruder,       colorin_raw_infill);
+        colorin_restore(config.perimeter_extruder,    colorin_raw_perim);
+        colorin_restore(config.solid_infill_extruder, colorin_raw_solid);
+    }
     if (config.fill_density.value < 0.00011f)
         // Switch of infill for very low infill rates, also avoid division by zero in infill generator for these very low rates.
         // See GH issue #5910.
