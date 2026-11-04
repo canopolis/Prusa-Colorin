@@ -39,6 +39,9 @@
 // Prusa Colorin LZ-3c: Local-Z sub-passes (Orca 0.9.18)
 #include "libslic3r/GCode/ColorinLocalZEmit.hpp"
 #include "libslic3r/ImageMap/AdaptiveLocalZRenderer.hpp" // Prusa Colorin LZ-5b
+#include "libslic3r/ImageMap/PerimeterEnvelopeRenderer.hpp" // Prusa Colorin
+#include "libslic3r/MixedFilament.hpp" // Prusa Colorin
+#include "libslic3r/MixedFilament/PerimeterModulation.hpp" // Prusa Colorin
 #include "libslic3r/GCode/ColorinLocalZWipeTower.hpp" // Prusa Colorin LZ-4c2a
 #include "Point.hpp"
 #include "Polygon.hpp"
@@ -2419,6 +2422,49 @@ static inline double get_seam_gap_distance_value(const PrintConfig &config, cons
 
 using GCode::ExtrusionOrder::InstancePoint;
 
+// Prusa Colorin (Orca 0.9.18 GCode::modulate_mixed_filament_external_perimeter): mixed filaments with
+// perimeter modulation that are not owned by an OBJ image map shift the external perimeter per layer.
+static void colorin_modulate_external_perimeter(GCode::SmoothPath &smooth_path, const Layer &layer,
+                                                const PrintRegion &region, const PrintConfig &config)
+{
+    const PrintObject *object = layer.object();
+    if (object == nullptr || object->print() == nullptr)
+        return;
+    const size_t       num_physical = config.nozzle_diameter.size();
+    const unsigned int filament_id  = unsigned(std::max(0, region.config().perimeter_extruder.value));
+    const MixedFilamentManager &manager = object->print()->mixed_filament_manager();
+    if (num_physical < 2 || !manager.is_mixed(filament_id, num_physical))
+        return;
+    const std::optional<MixedFilamentDefinition> definition = manager.mixed_filament_definition_from_id(filament_id, num_physical);
+    if (!definition || !definition->behavior.surface_bias.perimeter_modulation)
+        return;
+    if (object->model_object() != nullptr &&
+        ImageMap::model_uses_perimeter_modulation_filament(*object->model_object(), definition->identity.stable_id, filament_id))
+        return;
+    const float surface_inset_mm = manager.component_surface_offset(filament_id, num_physical, int(layer.id()),
+                                                                     float(layer.print_z), float(layer.height));
+    if (std::abs(surface_inset_mm) <= EPSILON)
+        return;
+    for (GCode::SmoothPathElement &element : smooth_path) {
+        if (!element.path_attributes.role.is_external_perimeter() || element.path.size() < 2)
+            continue;
+        const float width = element.path_attributes.width > EPSILON ? float(element.path_attributes.width) :
+                                                                      float(config.nozzle_diameter.get_at(0));
+        const float max_shift_mm = MixedFilamentManager::max_component_surface_offset_mm(width);
+        Polyline polyline;
+        polyline.points.reserve(element.path.size());
+        for (const Geometry::ArcWelder::Segment &segment : element.path)
+            polyline.points.push_back(segment.point);
+        if (apply_mixed_filament_perimeter_modulation(polyline, layer.lslices, surface_inset_mm, max_shift_mm, width + max_shift_mm) &&
+            polyline.points.size() == element.path.size()) {
+            for (size_t i = 0; i < element.path.size(); ++i) {
+                element.path[i].point  = polyline.points[i];
+                element.path[i].radius = 0.f; // shifted points no longer lie on the fitted arc
+            }
+        }
+    }
+}
+
 struct SmoothPathGenerator
 {
     const Seams::Placer &seam_placer;
@@ -2482,6 +2528,9 @@ struct SmoothPathGenerator
                 clip_end(smooth_path_extension, smooth_path_extension_cut_length, scaled<double>(GCode::ExtrusionOrder::min_gcode_segment_length));
                 Slic3r::append(result, smooth_path_extension);
             }
+
+            if (layer != nullptr && region != nullptr && config.mixed_filament_component_bias_enabled.value)
+                colorin_modulate_external_perimeter(result, *layer, *region, config);
 
             assert(validate_smooth_path(result, !enable_loop_clipping));
         } else if (auto multipath = dynamic_cast<const ExtrusionMultiPath *>(extrusion_entity)) {
