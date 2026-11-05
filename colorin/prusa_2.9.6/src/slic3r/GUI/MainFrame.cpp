@@ -58,6 +58,7 @@
 #include "GUI_App.hpp"
 #include "UnsavedChangesDialog.hpp"
 #include "MsgDialog.hpp"
+#include <wx/busyinfo.h> // Prusa Colorin
 #include <boost/nowide/fstream.hpp> // Prusa Colorin
 #include <boost/algorithm/string/trim.hpp> // Prusa Colorin
 #include <set> // Prusa Colorin
@@ -1100,7 +1101,17 @@ void MainFrame::save_project()
 
 bool MainFrame::save_project_as(const wxString& filename)
 {
+    // Prusa Colorin: large full-colour models take a while to save; tell the user instead of looking frozen.
+    std::unique_ptr<wxBusyInfo> colorin_saving_info;
+    if (m_plater != nullptr) {
+        colorin_saving_info = std::make_unique<wxBusyInfo>(wxBusyInfoFlags()
+            .Parent(this)
+            .Title(_L("Saving project"))
+            .Text(_L("Saving the project with its colour data...\nLarge models can take up to a minute.")));
+        wxYield();
+    }
     bool ret = (m_plater != nullptr) ? m_plater->export_3mf(into_path(filename)) : false;
+    colorin_saving_info.reset();
     if (ret) {
         // Make a copy of the active presets for detecting changes in preset values.
         wxGetApp().update_saved_preset_from_current_preset();
