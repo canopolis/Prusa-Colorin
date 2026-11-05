@@ -3919,6 +3919,36 @@ void Tab::update_preset_choice()
 // Called by the UI combo box when the user switches profiles, and also to delete the current profile.
 // Select a preset by a name.If !defined(name), then the default preset is selected.
 // If the current profile is modified, user is asked to save the changes.
+// Prusa Colorin: a user printer whose default_filament_profile lists one filament per extruder (the
+// "Full Color Print" printers of the Prusa Colorin bundle) loads its whole filament set and its default
+// print profile as soon as it is selected, so the colours never have to be set by hand.
+static void colorin_apply_printer_defaults(PresetBundle *bundle)
+{
+    const Preset &printer = bundle->printers.get_edited_preset();
+    if (printer.printer_technology() != ptFFF || printer.is_system)
+        return;
+    const std::string default_print = printer.config.opt_string("default_print_profile");
+    if (!default_print.empty()) {
+        const Preset *print = bundle->prints.find_preset(default_print, false);
+        if (print != nullptr && print->is_compatible)
+            bundle->prints.select_preset_by_name(default_print, true);
+    }
+    const auto *filaments = printer.config.option<ConfigOptionStrings>("default_filament_profile");
+    const auto *nozzles   = printer.config.option<ConfigOptionFloats>("nozzle_diameter");
+    if (filaments == nullptr || nozzles == nullptr || nozzles->values.size() < 2 ||
+        filaments->values.size() != nozzles->values.size())
+        return;
+    for (const std::string &name : filaments->values)
+        if (name.empty() || bundle->filaments.find_preset(name, false) == nullptr)
+            return;
+    bundle->update_multi_material_filament_presets();
+    if (bundle->extruders_filaments.size() != filaments->values.size())
+        return;
+    for (size_t i = 0; i < filaments->values.size(); ++i)
+        bundle->extruders_filaments[i].select_filament(filaments->values[i]);
+    bundle->filaments.select_preset_by_name(filaments->values.front(), true);
+}
+
 bool Tab::select_preset(std::string preset_name, bool delete_current /*=false*/, const std::string& last_selected_ph_printer_name/* =""*/)
 {
     if (preset_name.empty()) {
@@ -4074,6 +4104,8 @@ bool Tab::select_preset(std::string preset_name, bool delete_current /*=false*/,
             m_preset_bundle->update_compatible(
             	update_compatible_type(technology_changed, print_tab,   (print_tab ? this : wxGetApp().get_tab(Preset::TYPE_PRINT))->m_show_incompatible_presets),
             	update_compatible_type(technology_changed, false, 		wxGetApp().get_tab(Preset::TYPE_FILAMENT)->m_show_incompatible_presets));
+        if (printer_tab && is_selected)
+            colorin_apply_printer_defaults(m_preset_bundle);
         // Initialize the UI from the current preset.
         if (printer_tab)
             static_cast<TabPrinter*>(this)->update_pages();
