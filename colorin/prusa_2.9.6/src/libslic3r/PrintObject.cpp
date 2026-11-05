@@ -235,8 +235,11 @@ void PrintObject::make_perimeters()
 
     // Prusa Colorin (Orca 0.9.18 PrintObject.cpp 314-328): la modulacion de perimetros por imagen V2 es geometrica.
     // Se remodela cada capa antes de generar las paredes, para que paredes e infill salgan de la misma envolvente.
+    const auto colorin_t0 = std::chrono::steady_clock::now(); // Prusa Colorin timing
     const std::unique_ptr<ImageMap::PerimeterEnvelopeRenderer> image_map_perimeter_renderer =
         ImageMap::PerimeterEnvelopeRenderer::create(*this);
+    const auto colorin_t1 = std::chrono::steady_clock::now();
+    BOOST_LOG_TRIVIAL(warning) << "Colorin TIME renderer_create_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(colorin_t1 - colorin_t0).count() << " renderer=" << (image_map_perimeter_renderer != nullptr);
     if (image_map_perimeter_renderer != nullptr) {
         std::atomic<bool> any_layer_changed{false};
         tbb::parallel_for(
@@ -249,8 +252,12 @@ void PrintObject::make_perimeters()
                 }
             });
         m_print->throw_if_canceled();
+        const auto colorin_t2 = std::chrono::steady_clock::now();
         if (any_layer_changed)
             colorin_rebuild_layer_islands(*this, m_layers);
+        const auto colorin_t3 = std::chrono::steady_clock::now();
+        BOOST_LOG_TRIVIAL(warning) << "Colorin TIME apply_to_slices_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(colorin_t2 - colorin_t1).count()
+                                   << " rebuild_islands_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(colorin_t3 - colorin_t2).count() << " changed=" << bool(any_layer_changed);
     }
     
     // compare each layer to the one below, and mark those slices needing
