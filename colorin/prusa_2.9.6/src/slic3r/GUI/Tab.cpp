@@ -1235,6 +1235,8 @@ void Tab::apply_config_from_cache()
 // to update the filament colors of the selection boxes,
 // to update the "dirty" flags of the selection boxes,
 // to update number of "filament" selection boxes when the number of extruders change.
+void colorin_apply_printer_defaults_ui(); // Prusa Colorin, Sidebar.cpp
+
 void Tab::on_presets_changed()
 {
     if (wxGetApp().plater() == nullptr)
@@ -1260,6 +1262,10 @@ void Tab::on_presets_changed()
     // Update Project dirty state, update application title bar.
     if (wxGetApp().mainframe)
         wxGetApp().plater()->update_project_dirty_from_presets();
+
+    // Prusa Colorin: a newly picked printer brings its own print profile and filaments.
+    if (m_type == Preset::TYPE_PRINTER && wxGetApp().mainframe)
+        colorin_apply_printer_defaults_ui();
 }
 
 void Tab::build_preset_description_line(ConfigOptionsGroup* optgroup)
