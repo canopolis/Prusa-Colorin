@@ -1848,6 +1848,24 @@ void PresetBundle::update_multi_material_filament_presets()
         for (size_t id = extruders_filaments.size(); id < num_extruders; id++)
             extruders_filaments.emplace_back(ExtruderFilaments(&filaments, id, id == 0 ? filaments.first_visible().name : extruders_filaments[id - 1].get_selected_preset_name()));
 
+    // Prusa Colorin: when the selected printer changes, load that printer's per-extruder default filaments
+    // (default_filament_profile with one entry per extruder), so each colour slot is filled automatically.
+    {
+        static std::string colorin_last_printer;
+        const std::string  colorin_printer = printers.get_selected_preset_name();
+        if (colorin_printer != colorin_last_printer) {
+            colorin_last_printer = colorin_printer;
+            const auto *colorin_defaults = printers.get_edited_preset().config.option<ConfigOptionStrings>("default_filament_profile");
+            if (colorin_defaults != nullptr && colorin_defaults->values.size() == num_extruders && num_extruders > 1) {
+                for (size_t i = 0; i < num_extruders; ++i) {
+                    const Preset *colorin_filament = this->filaments.find_preset(colorin_defaults->values[i], false);
+                    if (colorin_filament != nullptr && colorin_filament->is_visible)
+                        this->extruders_filaments[i].select_filament(colorin_filament->name);
+                }
+            }
+        }
+    }
+
     // Now verify if wiping_volumes_matrix has proper size (it is used to deduce number of extruders in wipe tower generator):
     std::vector<double> old_matrix = this->project_config.option<ConfigOptionFloats>("wiping_volumes_matrix")->values;
     size_t old_number_of_extruders = size_t(std::sqrt(old_matrix.size())+EPSILON);
