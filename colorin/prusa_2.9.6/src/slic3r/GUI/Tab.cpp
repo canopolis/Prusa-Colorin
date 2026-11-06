@@ -1263,9 +1263,6 @@ void Tab::on_presets_changed()
     if (wxGetApp().mainframe)
         wxGetApp().plater()->update_project_dirty_from_presets();
 
-    // Prusa Colorin: a newly picked printer brings its own print profile and filaments.
-    if (m_type == Preset::TYPE_PRINTER && wxGetApp().mainframe)
-        colorin_apply_printer_defaults_ui();
 }
 
 void Tab::build_preset_description_line(ConfigOptionsGroup* optgroup)
@@ -3957,6 +3954,8 @@ static void colorin_apply_printer_defaults(PresetBundle *bundle)
 
 bool Tab::select_preset(std::string preset_name, bool delete_current /*=false*/, const std::string& last_selected_ph_printer_name/* =""*/)
 {
+    // Prusa Colorin: remember the printer before this selection (see the end of this function).
+    const std::string colorin_old_printer = (m_type == Preset::TYPE_PRINTER) ? m_presets->get_edited_preset().name : std::string();
     if (preset_name.empty()) {
         if (delete_current) {
             // Find an alternate preset to be selected after the current preset is deleted.
@@ -4110,8 +4109,6 @@ bool Tab::select_preset(std::string preset_name, bool delete_current /*=false*/,
             m_preset_bundle->update_compatible(
             	update_compatible_type(technology_changed, print_tab,   (print_tab ? this : wxGetApp().get_tab(Preset::TYPE_PRINT))->m_show_incompatible_presets),
             	update_compatible_type(technology_changed, false, 		wxGetApp().get_tab(Preset::TYPE_FILAMENT)->m_show_incompatible_presets));
-        if (printer_tab && is_selected)
-            colorin_apply_printer_defaults(m_preset_bundle);
         // Initialize the UI from the current preset.
         if (printer_tab)
             static_cast<TabPrinter*>(this)->update_pages();
@@ -4141,6 +4138,12 @@ bool Tab::select_preset(std::string preset_name, bool delete_current /*=false*/,
 
     if (technology_changed)
         wxGetApp().mainframe->technology_changed();
+
+    // Prusa Colorin: only a printer picked by the user (not a project being opened) brings its own
+    // print profile and filaments, so a loaded project keeps its own settings and colour mixes.
+    if (m_type == Preset::TYPE_PRINTER && !canceled && !delete_current && wxGetApp().mainframe &&
+        m_presets->get_edited_preset().name != colorin_old_printer)
+        colorin_apply_printer_defaults_ui();
 
     return !canceled;
 }
