@@ -3956,6 +3956,10 @@ bool Tab::select_preset(std::string preset_name, bool delete_current /*=false*/,
 {
     // Prusa Colorin: remember the printer before this selection (see the end of this function).
     const std::string colorin_old_printer = (m_type == Preset::TYPE_PRINTER) ? m_presets->get_edited_preset().name : std::string();
+    // Prusa Colorin: keep the colour mixes of the current project (e.g. the mix an imported OBJ uses).
+    std::string colorin_old_mixes;
+    if (m_type == Preset::TYPE_PRINTER && m_preset_bundle->project_config.has("mixed_filament_definitions"))
+        colorin_old_mixes = m_preset_bundle->project_config.opt_string("mixed_filament_definitions");
     if (preset_name.empty()) {
         if (delete_current) {
             // Find an alternate preset to be selected after the current preset is deleted.
@@ -4142,8 +4146,15 @@ bool Tab::select_preset(std::string preset_name, bool delete_current /*=false*/,
     // Prusa Colorin: only a printer picked by the user (not a project being opened) brings its own
     // print profile and filaments, so a loaded project keeps its own settings and colour mixes.
     if (m_type == Preset::TYPE_PRINTER && !canceled && !delete_current && wxGetApp().mainframe &&
-        m_presets->get_edited_preset().name != colorin_old_printer)
+        m_presets->get_edited_preset().name != colorin_old_printer) {
+        if (!colorin_old_mixes.empty())
+            m_preset_bundle->project_config.set_key_value("mixed_filament_definitions", new ConfigOptionString(colorin_old_mixes));
         colorin_apply_printer_defaults_ui();
+        if (!colorin_old_mixes.empty()) {
+            m_preset_bundle->project_config.set_key_value("mixed_filament_definitions", new ConfigOptionString(colorin_old_mixes));
+            wxGetApp().plater()->on_config_change(m_preset_bundle->full_config());
+        }
+    }
 
     return !canceled;
 }
