@@ -250,6 +250,46 @@ jobs:
           Write-Host "Archivos en el portable: $((Get-ChildItem $pkg -Recurse -File).Count)"
           Compress-Archive -Path "$pkg\*" -DestinationPath "PrusaColorin-portable-${{ github.run_number }}.zip"
 
+      - name: Crear instalador
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          if (-not (Test-Path $iscc)) { Write-Error "No se encontro Inno Setup"; exit 1 }
+          $exeName = (Get-ChildItem C:\pkg\PrusaColorin -Filter "prusa-slicer.exe" | Select-Object -First 1).Name
+          if (-not $exeName) { $exeName = (Get-ChildItem C:\pkg\PrusaColorin -Filter "PrusaSlicer.exe" | Select-Object -First 1).Name }
+          $lines = @(
+            '[Setup]'
+            'AppName=Prusa Colorin'
+            'AppVersion=${{ github.run_number }}'
+            'DefaultDirName={autopf}\Prusa Colorin'
+            'DefaultGroupName=Prusa Colorin'
+            'OutputDir=C:\pkg'
+            'OutputBaseFilename=PrusaColorin-setup-${{ github.run_number }}'
+            'Compression=lzma2'
+            'SolidCompression=yes'
+            'ArchitecturesAllowed=x64'
+            'ArchitecturesInstallIn64BitMode=x64'
+            'PrivilegesRequiredOverridesAllowed=dialog'
+            'UninstallDisplayName=Prusa Colorin'
+            ''
+            '[Files]'
+            'Source: "C:\pkg\PrusaColorin\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion'
+            ''
+            '[Icons]'
+            'Name: "{group}\Prusa Colorin"; Filename: "{app}\' + $exeName + '"'
+            'Name: "{autodesktop}\Prusa Colorin"; Filename: "{app}\' + $exeName + '"'
+          )
+          Set-Content -Path C:\pkg\colorin.iss -Value $lines -Encoding UTF8
+          & $iscc C:\pkg\colorin.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Subir instalador
+        uses: actions/upload-artifact@v4
+        with:
+          name: PrusaColorin-setup-${{ github.run_number }}
+          path: C:\pkg\PrusaColorin-setup-${{ github.run_number }}.exe
+
       - name: Subir resultado
         uses: actions/upload-artifact@v4
         with:
