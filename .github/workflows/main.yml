@@ -118,7 +118,7 @@ jobs:
           $h = (Get-FileHash C:\ocv.tar.gz -Algorithm SHA256).Hash.ToLower()
           if ($h -ne '1ec1cba65f9f20fe5a41fda1586e01c70ea0c9a6d7b67c9e13edf0cfe2239277') { Write-Error "Hash de OpenCV no coincide"; exit 1 }
           tar -xzf C:\ocv.tar.gz -C C:\
-          Invoke-WebRequest https://raw.githubusercontent.com/canopolis/OrcaSlicer-FullSpectrum-Plus/v0.9.18/deps/OpenCV/0001-vs2022.patch -OutFile C:\ocv-vs2022.patch
+          Copy-Item -Force "$env:GITHUB_WORKSPACE\colorin\deps\0001-vs2022.patch" C:\ocv-vs2022.patch
           Set-Location C:\opencv-4.6.0
           git apply --verbose --ignore-space-change --whitespace=fix C:\ocv-vs2022.patch
           if ($LASTEXITCODE -ne 0) { Write-Error "No se pudo aplicar el parche de OpenCV"; exit 1 }
