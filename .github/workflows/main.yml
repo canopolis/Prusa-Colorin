@@ -83,7 +83,7 @@ jobs:
           Copy-Item -Force "$env:GITHUB_WORKSPACE\colorin\prusa_2.9.6\CMakeLists.txt" "C:\ps\CMakeLists.txt"
           # Numero de compilacion en el titulo de la ventana (en vez de "+UNKNOWN").
           $vi = "C:\ps\version.inc"
-          (Get-Content $vi) -replace 'set\(SLIC3R_BUILD_ID .*\)', ('set(SLIC3R_BUILD_ID "Prusa Colorin #' + $env:GITHUB_RUN_NUMBER + '")') | Set-Content $vi
+          (Get-Content $vi) -replace 'set\(SLIC3R_BUILD_ID .*\)', ('set(SLIC3R_BUILD_ID "Prusa Slicer Colorin #' + $env:GITHUB_RUN_NUMBER + '")') | Set-Content $vi
           Select-String -Path $vi -Pattern "SLIC3R_BUILD_ID"
           Get-ChildItem "$env:GITHUB_WORKSPACE\colorin\prusa_2.9.6" -Recurse -File | ForEach-Object { Write-Host "Reemplazado: $($_.Name)" }
 
@@ -118,7 +118,7 @@ jobs:
           $h = (Get-FileHash C:\ocv.tar.gz -Algorithm SHA256).Hash.ToLower()
           if ($h -ne '1ec1cba65f9f20fe5a41fda1586e01c70ea0c9a6d7b67c9e13edf0cfe2239277') { Write-Error "Hash de OpenCV no coincide"; exit 1 }
           tar -xzf C:\ocv.tar.gz -C C:\
-          Copy-Item -Force "$env:GITHUB_WORKSPACE\colorin\deps\0001-vs2022.patch" C:\ocv-vs2022.patch
+          Invoke-WebRequest https://raw.githubusercontent.com/canopolis/OrcaSlicer-FullSpectrum-Plus/v0.9.18/deps/OpenCV/0001-vs2022.patch -OutFile C:\ocv-vs2022.patch
           Set-Location C:\opencv-4.6.0
           git apply --verbose --ignore-space-change --whitespace=fix C:\ocv-vs2022.patch
           if ($LASTEXITCODE -ne 0) { Write-Error "No se pudo aplicar el parche de OpenCV"; exit 1 }
@@ -260,10 +260,10 @@ jobs:
           if (-not $exeName) { $exeName = (Get-ChildItem C:\pkg\PrusaColorin -Filter "PrusaSlicer.exe" | Select-Object -First 1).Name }
           $lines = @(
             '[Setup]'
-            'AppName=Prusa Colorin'
+            'AppName=Prusa Slicer Colorin'
             'AppVersion=${{ github.run_number }}'
-            'DefaultDirName={autopf}\Prusa Colorin'
-            'DefaultGroupName=Prusa Colorin'
+            'DefaultDirName={autopf}\Prusa Slicer Colorin'
+            'DefaultGroupName=Prusa Slicer Colorin'
             'OutputDir=C:\pkg'
             'OutputBaseFilename=PrusaColorin-setup-${{ github.run_number }}'
             'Compression=lzma2'
@@ -271,14 +271,14 @@ jobs:
             'ArchitecturesAllowed=x64'
             'ArchitecturesInstallIn64BitMode=x64'
             'PrivilegesRequiredOverridesAllowed=dialog'
-            'UninstallDisplayName=Prusa Colorin'
+            'UninstallDisplayName=Prusa Slicer Colorin'
             ''
             '[Files]'
             'Source: "C:\pkg\PrusaColorin\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion'
             ''
             '[Icons]'
-            'Name: "{group}\Prusa Colorin"; Filename: "{app}\' + $exeName + '"'
-            'Name: "{autodesktop}\Prusa Colorin"; Filename: "{app}\' + $exeName + '"'
+            'Name: "{group}\Prusa Slicer Colorin"; Filename: "{app}\' + $exeName + '"'
+            'Name: "{autodesktop}\Prusa Slicer Colorin"; Filename: "{app}\' + $exeName + '"'
           )
           Set-Content -Path C:\pkg\colorin.iss -Value $lines -Encoding UTF8
           & $iscc C:\pkg\colorin.iss
