@@ -1225,21 +1225,33 @@ indexed_triangle_set cut_surface_to_its(const ExPolygons &shapes, const Transfor
         // with less than 150k triangles under the shape). Simplify only this temporary copy of the area under the
         // SVG/text, with a tiny geometric tolerance, before cutting. The model itself is not changed.
         const size_t colorin_before = its.indices.size();
-        if (colorin_allow_simplify && colorin_before > 20000) {
-            // take a wider area, so the simplified border stays away from the shape
+        if (colorin_allow_simplify) {
+            // always simplify (requested by the user), take a wider area so the simplified border stays away from the shape
             BoundingBox colorin_bb = bb;
             const Point colorin_size = bb.size();
             colorin_bb.offset(double(std::max(colorin_size.x(), colorin_size.y())) * 0.1);
             indexed_triangle_set colorin_wide = its_cut_AoI(s.mesh->its, colorin_bb, cut_projection);
-            if (!colorin_wide.indices.empty())
-                its = std::move(colorin_wide);
-            const size_t colorin_wide_count = its.indices.size();
-            const size_t colorin_target = std::max<size_t>(20000, colorin_wide_count * 20000 / colorin_before);
+            if (colorin_wide.indices.empty())
+                colorin_wide = its;
+            const size_t colorin_wide_count = colorin_wide.indices.size();
+            const size_t colorin_target = std::min<size_t>(colorin_wide_count * 20000 / colorin_before, colorin_wide_count / 2);
+            indexed_triangle_set colorin_simple = colorin_wide;
             float colorin_max_error = 1e-4f; // quadric error ~ squared distance in mm (about 0.01 mm)
-            its_quadric_edge_collapse(its, uint32_t(colorin_target), &colorin_max_error);
-            colorin_simplified = true;
+            its_quadric_edge_collapse(colorin_simple, uint32_t(colorin_target), &colorin_max_error);
+            // guard: the simplifier does not protect open borders, the simplified area must still cover the same box
+            const BoundingBoxf3 colorin_box0 = bounding_box(colorin_wide);
+            const BoundingBoxf3 colorin_box1 = colorin_simple.indices.empty() ? BoundingBoxf3() : bounding_box(colorin_simple);
+            const double colorin_tol = 0.01 * colorin_box0.size().norm();
+            const bool colorin_ok = !colorin_simple.indices.empty() && colorin_box1.defined &&
+                (colorin_box0.min - colorin_box1.min).norm() <= colorin_tol && (colorin_box0.max - colorin_box1.max).norm() <= colorin_tol;
+            const size_t colorin_simple_count = colorin_simple.indices.size();
+            if (colorin_ok) {
+                its = std::move(colorin_simple);
+                colorin_simplified = true;
+            }
             BOOST_LOG_TRIVIAL(info) << "Colorin emboss surface: area under shape " << colorin_before << " triangles, wide area "
-                                    << colorin_wide_count << ", simplified to " << its.indices.size() << ", at " << colorin_ms() << " ms";
+                                    << colorin_wide_count << ", simplified to " << colorin_simple_count
+                                    << (colorin_ok ? ", used" : ", NOT used (border moved)") << ", at " << colorin_ms() << " ms";
             if (was_canceled())
                 return {};
         } else {
