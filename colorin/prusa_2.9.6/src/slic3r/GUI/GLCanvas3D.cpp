@@ -307,10 +307,11 @@ void GLCanvas3D::LayersEditing::render_overlay(const GLCanvas3D& canvas)
 
     const Size& cnv_size = canvas.get_canvas_size();
 
-    ImGuiPureWrap::set_next_window_pos(static_cast<float>(cnv_size.get_width()) - wxGetApp().imgui()->get_style_scaling() * THICKNESS_BAR_WIDTH,
-        static_cast<float>(cnv_size.get_height()), ImGuiCond_Always, 1.0f, 1.0f);
+    // Prusa Colorin: top left and movable (it was fixed at the bottom right corner and could be cut by the window border)
+    (void) cnv_size;
+    ImGuiPureWrap::set_next_window_pos(wxGetApp().imgui()->get_style_scaling() * 110.0f, wxGetApp().imgui()->get_style_scaling() * 80.0f, ImGuiCond_Appearing, 0.0f, 0.0f);
 
-    ImGuiPureWrap::begin(_u8L("Variable layer height"), ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
+    ImGuiPureWrap::begin(_u8L("Variable layer height"), ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
 
     ImGuiPureWrap::text_colored(ImGuiPureWrap::COL_ORANGE_LIGHT, _u8L("Left mouse button:"));
     ImGui::SameLine();
