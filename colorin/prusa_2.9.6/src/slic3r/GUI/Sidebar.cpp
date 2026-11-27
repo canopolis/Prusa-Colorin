@@ -1419,6 +1419,41 @@ void Sidebar::update_sliced_info_sizer()
                     }
                 }
 
+                // Prusa Colorin: grand totals in grams for all extruders (objects / wipe tower / flush / total).
+                if (ps.filament_stats.size() > 1 || is_wipe_tower || is_flush) {
+                    double colorin_objects_g = 0., colorin_tower_g = 0., colorin_flush_g = 0.;
+                    for (const auto& [colorin_id, colorin_vol] : ps.filament_stats) {
+                        if (colorin_id >= extruders_filaments.size())
+                            continue;
+                        const Preset* colorin_preset = extruders_filaments[colorin_id].get_selected_preset();
+                        if (colorin_preset == nullptr)
+                            continue;
+                        const double colorin_density = colorin_preset->config.opt_float("filament_density", 0);
+                        double colorin_fvol = 0., colorin_tvol = 0.;
+                        if (auto it = ps.flush_stats.find(colorin_id); it != ps.flush_stats.end())
+                            colorin_fvol = it->second;
+                        if (auto it = ps.wipe_tower_stats.find(colorin_id); it != ps.wipe_tower_stats.end())
+                            colorin_tvol = it->second;
+                        colorin_objects_g += (colorin_vol - colorin_fvol - colorin_tvol) * colorin_density * 0.001;
+                        colorin_tower_g   += colorin_tvol * colorin_density * 0.001;
+                        colorin_flush_g   += colorin_fvol * colorin_density * 0.001;
+                    }
+                    new_label += "\n" + _L("All extruders (g)") + ":";
+                    info_text += "\n";
+                    new_label += "\n    - " + _L("objects");
+                    info_text += wxString::Format("\n%.2f", colorin_objects_g);
+                    if (is_wipe_tower) {
+                        new_label += "\n    - " + _L("wipe tower");
+                        info_text += wxString::Format("\n%.2f", colorin_tower_g);
+                    }
+                    if (is_flush) {
+                        new_label += "\n    - " + _L("flush");
+                        info_text += wxString::Format("\n%.2f", colorin_flush_g);
+                    }
+                    new_label += "\n    - " + _L("total");
+                    info_text += wxString::Format("\n%.2f", colorin_objects_g + colorin_tower_g + colorin_flush_g);
+                }
+
                 m_sliced_info->SetTextAndShow(siFilament_g, info_text, new_label);
             }
 
