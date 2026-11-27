@@ -5,6 +5,7 @@
 #include "EmbossJob.hpp"
 
 #include <stdexcept>
+#include <chrono>
 #include <type_traits>
 #include <boost/log/trivial.hpp>
 
@@ -1196,8 +1197,11 @@ OrthoProject3d create_emboss_projection(bool is_outside, float emboss, Transform
     return OrthoProject3d(from_front_to_back);
 }
 
-indexed_triangle_set cut_surface_to_its(const ExPolygons &shapes, const Transform3d& tr,const SurfaceVolumeData::ModelSources &sources, DataBase& input, std::function<bool()> was_canceled) {
+indexed_triangle_set cut_surface_to_its(const ExPolygons &shapes, const Transform3d& tr,const SurfaceVolumeData::ModelSources &sources, DataBase& input, std::function<bool()> was_canceled, bool colorin_allow_simplify = true) {
     assert(!sources.empty());
+    bool colorin_simplified = false;
+    const auto colorin_t0 = std::chrono::steady_clock::now();
+    auto colorin_ms = [&colorin_t0]() { return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - colorin_t0).count(); };
     BoundingBox bb = get_extents(shapes);
     double shape_scale = input.shape.scale;
 
@@ -1217,17 +1221,29 @@ indexed_triangle_set cut_surface_to_its(const ExPolygons &shapes, const Transfor
         indexed_triangle_set its = its_cut_AoI(s.mesh->its, bb, cut_projection);
         if (its.indices.empty())
             continue;
-        // Prusa Colorin: very dense models (e.g. 1.5M-triangle textured OBJ) make the CGAL surface cut take minutes
-        // and many GB of RAM. Simplify only this temporary copy of the area under the SVG/text, with a tiny
-        // geometric tolerance, before cutting. The model itself is not changed.
-        if (its.indices.size() > 150000) {
+        // Prusa Colorin: the CGAL surface cut is very slow and memory hungry on dense models (measured: about 45 s
+        // with less than 150k triangles under the shape). Simplify only this temporary copy of the area under the
+        // SVG/text, with a tiny geometric tolerance, before cutting. The model itself is not changed.
+        const size_t colorin_before = its.indices.size();
+        if (colorin_allow_simplify && colorin_before > 20000) {
+            // take a wider area, so the simplified border stays away from the shape
+            BoundingBox colorin_bb = bb;
+            const Point colorin_size = bb.size();
+            colorin_bb.offset(double(std::max(colorin_size.x(), colorin_size.y())) * 0.1);
+            indexed_triangle_set colorin_wide = its_cut_AoI(s.mesh->its, colorin_bb, cut_projection);
+            if (!colorin_wide.indices.empty())
+                its = std::move(colorin_wide);
+            const size_t colorin_wide_count = its.indices.size();
+            const size_t colorin_target = std::max<size_t>(20000, colorin_wide_count * 20000 / colorin_before);
             float colorin_max_error = 1e-4f; // quadric error ~ squared distance in mm (about 0.01 mm)
-            const size_t colorin_before = its.indices.size();
-            its_quadric_edge_collapse(its, 150000, &colorin_max_error);
-            BOOST_LOG_TRIVIAL(info) << "Colorin emboss surface: simplified area under shape from " << colorin_before
-                                    << " to " << its.indices.size() << " triangles";
+            its_quadric_edge_collapse(its, uint32_t(colorin_target), &colorin_max_error);
+            colorin_simplified = true;
+            BOOST_LOG_TRIVIAL(info) << "Colorin emboss surface: area under shape " << colorin_before << " triangles, wide area "
+                                    << colorin_wide_count << ", simplified to " << its.indices.size() << ", at " << colorin_ms() << " ms";
             if (was_canceled())
                 return {};
+        } else {
+            BOOST_LOG_TRIVIAL(info) << "Colorin emboss surface: area under shape " << colorin_before << " triangles, not simplified, at " << colorin_ms() << " ms";
         }
         if (biggest_count < its.vertices.size()) {
             biggest_count = its.vertices.size();
@@ -1286,6 +1302,7 @@ indexed_triangle_set cut_surface_to_its(const ExPolygons &shapes, const Transfor
 
     // Use CGAL to cut surface from triangle mesh
     SurfaceCut cut = cut_surface(*shapes_ptr, itss, cut_projection, projection_ratio);
+    BOOST_LOG_TRIVIAL(info) << "Colorin emboss surface: cut done at " << colorin_ms() << " ms, result triangles " << cut.indices.size();
 
     if (is_text_reflected) {
         for (SurfaceCut::Contour &c : cut.contours)
@@ -1294,6 +1311,11 @@ indexed_triangle_set cut_surface_to_its(const ExPolygons &shapes, const Transfor
             std::swap(t[0], t[1]);
     }
 
+    if (cut.empty() && colorin_simplified && !was_canceled()) {
+        // Prusa Colorin: safety net, repeat without simplification
+        BOOST_LOG_TRIVIAL(warning) << "Colorin emboss surface: empty cut after simplification, repeating without it";
+        return cut_surface_to_its(shapes, tr, sources, input, was_canceled, false);
+    }
     if (cut.empty()) return {}; // There is no valid surface for text projection.
     if (was_canceled()) return {};
 
