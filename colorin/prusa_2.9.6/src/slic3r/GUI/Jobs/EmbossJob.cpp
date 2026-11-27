@@ -686,6 +686,9 @@ bool start_update_volume(DataUpdate &&data, const ModelVolume &volume, const Sel
 #endif // EXECUTE_UPDATE_ON_MAIN_THREAD
 }
 
+// Prusa Colorin: the SVG tool asks for one exact (not simplified) surface calculation when it is closed
+std::atomic<const void *> colorin_exact_surface_token{nullptr};
+void colorin_request_exact_surface(const void *token) { colorin_exact_surface_token.store(token); }
 } // namespace Slic3r::GUI::Emboss
 
 ////////////////////////////
@@ -1200,6 +1203,9 @@ OrthoProject3d create_emboss_projection(bool is_outside, float emboss, Transform
 indexed_triangle_set cut_surface_to_its(const ExPolygons &shapes, const Transform3d& tr,const SurfaceVolumeData::ModelSources &sources, DataBase& input, std::function<bool()> was_canceled, bool colorin_allow_simplify = true) {
     assert(!sources.empty());
     bool colorin_simplified = false;
+    // exact (not simplified): text, and the final SVG calculation requested when the SVG tool is closed
+    if (!input.shape.svg_file.has_value() || (const void *) input.cancel.get() == colorin_exact_surface_token.load())
+        colorin_allow_simplify = false;
     const auto colorin_t0 = std::chrono::steady_clock::now();
     auto colorin_ms = [&colorin_t0]() { return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - colorin_t0).count(); };
     BoundingBox bb = get_extents(shapes);
@@ -1234,7 +1240,7 @@ indexed_triangle_set cut_surface_to_its(const ExPolygons &shapes, const Transfor
             if (colorin_wide.indices.empty())
                 colorin_wide = its;
             const size_t colorin_wide_count = colorin_wide.indices.size();
-            const size_t colorin_target = std::min<size_t>(colorin_wide_count * 20000 / colorin_before, colorin_wide_count / 2);
+            const size_t colorin_target = std::min<size_t>(colorin_wide_count * 10000 / colorin_before, colorin_wide_count / 2);
             indexed_triangle_set colorin_simple = colorin_wide;
             float colorin_max_error = 1e-4f; // quadric error ~ squared distance in mm (about 0.01 mm)
             its_quadric_edge_collapse(colorin_simple, uint32_t(colorin_target), &colorin_max_error);
