@@ -1299,13 +1299,24 @@ indexed_triangle_set cut_surface_to_its(const ExPolygons &shapes, const Transfor
     Transform3d             emboss_tr  = cut_projection_tr.inverse();
     BoundingBoxf3           mesh_bb_tr = mesh_bb.transformed(emboss_tr);
     std::pair<float, float> z_range{mesh_bb_tr.min.z(), mesh_bb_tr.max.z()};
-    OrthoProject cut_projection = create_projection_for_cut(cut_projection_tr, shape_scale, z_range);
     float projection_ratio = (-z_range.first + safe_extension) / 
                               (z_range.second - z_range.first + 2 * safe_extension);
 
     ExPolygons shapes_data; // is used only when text is reflected to reverse polygon points order
     const ExPolygons *shapes_ptr = &shapes;
     bool is_text_reflected = Slic3r::has_reflection(tr);
+
+    // Prusa Colorin: do the CGAL cut in the coordinate system of the shape (emboss frame), where the
+    // projection direction is exactly the Z axis. When the projection is oblique to the axes of the
+    // model, bounding boxes of the long projection walls overlap most of the model triangles and
+    // CGAL corefinement needs minutes and gigabytes of memory. The result is the same.
+    bool colorin_aligned = !is_text_reflected && emboss_tr.linear().determinant() > 0.;
+    if (colorin_aligned) {
+        for (indexed_triangle_set &its : itss)
+            its_transform(its, emboss_tr);
+    }
+    OrthoProject cut_projection = create_projection_for_cut(colorin_aligned ? Transform3d::Identity() : cut_projection_tr, shape_scale, z_range);
+    BOOST_LOG_TRIVIAL(info) << "Colorin emboss surface: aligned_cut=" << (colorin_aligned ? 1 : 0);
     if (is_text_reflected) {
         // revert order of points in expolygons
         // CW --> CCW
@@ -1338,7 +1349,9 @@ indexed_triangle_set cut_surface_to_its(const ExPolygons &shapes, const Transfor
     if (was_canceled()) return {};
 
     // !! Projection needs to transform cut
-    OrthoProject3d projection = create_emboss_projection(input.is_outside, input.shape.projection.depth, emboss_tr, cut);
+    // Prusa Colorin: aligned cut is already in the emboss coordinate system
+    OrthoProject3d projection = create_emboss_projection(input.is_outside, input.shape.projection.depth,
+                                                         colorin_aligned ? Transform3d::Identity() : emboss_tr, cut);
     return cut2model(cut, projection);
 }
 
